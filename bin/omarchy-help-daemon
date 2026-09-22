@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
+# NOTE: NOT `#!/usr/bin/env python3` -- on this machine `python3` on PATH
+# resolves to a mise-managed interpreter that doesn't have `gi`/python-gobject
+# (that package installs into the system Python's site-packages). Hardcode
+# the system interpreter so tier-1 AT-SPI actually loads.
 """omarchy-help-daemon — polls the cursor position and resolves what's
 under it via a tiered fallback, emitting one JSON line per CHANGE to
 stdout for Service.qml to consume.
@@ -164,6 +168,43 @@ def atspi_hit(x, y):
     return None
 
 
+# --- Tier "bar": Omarchy's own bar, generic (spike result, see README) --
+#
+# Confirmed live on this machine: Quickshell registers AT-SPI application
+# entries ("quickshell"/"qs") but exposes ZERO accessible children beneath
+# them -- tier 1 genuinely cannot resolve individual bar icons here. The
+# bar is a Wayland layer-shell surface (namespace "omarchy-bar" per
+# `hyprctl layers -j`), not a regular window, so tier 2 doesn't see it
+# either. This tier at least identifies "you're over the bar" generically
+# from real layer-shell geometry, rather than falling through to nothing.
+# Per-icon resolution would need either shell-side cooperation (a new API,
+# out of scope for a plugin) or reimplementing the whole bar as a
+# "bar"-kind plugin (which does get widget-registry access) -- documented
+# as a known limit, not faked here.
+
+def bar_hit(x, y):
+    try:
+        out = subprocess.run(["hyprctl", "layers", "-j"], capture_output=True, text=True, timeout=0.3)
+        layers = json.loads(out.stdout)
+    except Exception:
+        return None
+    for monitor_data in layers.values():
+        for level_layers in monitor_data.get("levels", {}).values():
+            for layer in level_layers:
+                ns = str(layer.get("namespace", ""))
+                if "bar" not in ns.lower():
+                    continue
+                lx, ly = layer.get("x", 0), layer.get("y", 0)
+                lw, lh = layer.get("w", 0), layer.get("h", 0)
+                if lx <= x < lx + lw and ly <= y < ly + lh:
+                    return {
+                        "tier": "bar", "name": "Omarchy bar", "role": "",
+                        "detail": "Per-icon detail isn't available here (see README) "
+                                  "-- hover an app window for AT-SPI/window-level detail.",
+                    }
+    return None
+
+
 # --- Tier 2: Hyprland window-at-point ------------------------------------
 
 def window_hit(x, y):
@@ -195,6 +236,10 @@ def window_hit(x, y):
 
 def resolve(x, y):
     hit = atspi_hit(x, y)
+    if hit:
+        hit["x"], hit["y"] = x, y
+        return hit
+    hit = bar_hit(x, y)
     if hit:
         hit["x"], hit["y"] = x, y
         return hit
