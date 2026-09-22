@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "renardoberou.help",
+  "name": "Help",
+  "version": "0.1.0",
+  "author": "Bernardo Roustand",
+  "license": "MIT",
+  "description": "Toggle on, then hover anything -- bar icons or app UI -- to see what it is and what it does, via AT-SPI where available.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Help",
+    "description": "Hover things to learn what they are.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

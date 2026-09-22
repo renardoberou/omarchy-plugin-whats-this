@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""omarchy-help-daemon — polls the cursor position and resolves what's
+under it via a tiered fallback, emitting one JSON line per CHANGE to
+stdout for Service.qml to consume.
+
+Tiers:
+  1. atspi  — Linux accessibility bus (gi.repository.Atspi). Best for GTK
+              apps; coverage for Qt is unverified on this machine as of
+              writing, and typically thin-to-absent for Electron apps.
+  2. window — Hyprland client-at-point hit test (hyprctl clients -j),
+              always available, identifies the app/window but not
+              individual controls inside it.
+  3. none   — nothing resolved.
+
+Degrades gracefully: if `python-gobject` isn't installed (gi.repository.Atspi
+unimportable), tier 1 is skipped entirely and every hover falls through to
+tier 2 -- the daemon still runs and is still useful, just at coarser
+granularity, rather than refusing to start. Install python-gobject
+(`sudo pacman -S --needed python-gobject`) to enable tier 1.
+
+Known gap: whether Omarchy's own Quickshell bar exposes anything over
+AT-SPI is unverified -- if it does, tier 1 will identify bar icons "for
+free" (no special-casing here); if it doesn't, hovering the bar currently
+falls through to tier 2, which will identify the shell's own window
+generically rather than the specific icon. See README "Known limits".
+"""
+import json
+import subprocess
+import sys
+import time
+
+POLL_HZ = 12
+POLL_INTERVAL = 1.0 / POLL_HZ
+ATSPI_TIMEOUT_MS = 250
+BLACKLIST_TTL_S = 60
+BLACKLIST_AFTER_FAILURES = 3
+MAX_DESCEND_DEPTH = 6
+
+try:
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+    ATSPI_AVAILABLE = True
+    Atspi.set_timeout(ATSPI_TIMEOUT_MS, 0)
+except Exception as exc:  # ImportError, or a broken gi install
+    ATSPI_AVAILABLE = False
+    print(f"[help-daemon] AT-SPI unavailable ({exc}); tier 1 disabled, "
+          f"falling back to window-level identification only", file=sys.stderr)
+
+
+def log(*args):
+    print("[help-daemon]", *args, file=sys.stderr, flush=True)
+
+
+def cursor_pos():
+    try:
+        out = subprocess.run(
+            ["hyprctl", "cursorpos", "-j"], capture_output=True, text=True, timeout=0.3
+        )
+        d = json.loads(out.stdout)
+        return int(d["x"]), int(d["y"])
+    except Exception:
+        return None
+
+
+# --- Tier 1: AT-SPI -----------------------------------------------------
+
+_app_blacklist = {}  # bus-name-ish key -> (fail_count, blacklisted_until)
+
+
+def _app_key(app):
+    try:
+        return app.get_name() or str(app)
+    except Exception:
+        return str(id(app))
+
+
+def _blacklisted(key):
+    entry = _app_blacklist.get(key)
+    if not entry:
+        return False
+    fails, until = entry
+    if time.time() >= until:
+        _app_blacklist.pop(key, None)
+        return False
+    return True
+
+
+def _record_failure(key):
+    fails, _ = _app_blacklist.get(key, (0, 0))
+    fails += 1
+    until = time.time() + BLACKLIST_TTL_S if fails >= BLACKLIST_AFTER_FAILURES else 0
+    _app_blacklist[key] = (fails, until)
+
+
+def atspi_hit(x, y):
+    if not ATSPI_AVAILABLE:
+        return None
+    try:
+        desktop = Atspi.get_desktop(0)
+    except Exception:
+        return None
+
+    for i in range(desktop.get_child_count()):
+        try:
+            app = desktop.get_child_at_index(i)
+        except Exception:
+            continue
+        if app is None:
+            continue
+        key = _app_key(app)
+        if _blacklisted(key):
+            continue
+
+        try:
+            hit = None
+            # Pre-filter: only query windows whose own bounding box
+            # actually contains the point, to avoid hammering every app
+            # on every tick.
+            for wi in range(app.get_child_count()):
+                win = app.get_child_at_index(wi)
+                if win is None:
+                    continue
+                comp = win.get_component_iface()
+                if comp is None:
+                    continue
+                ext = comp.get_extents(Atspi.CoordType.SCREEN)
+                if not (ext.x <= x < ext.x + ext.width and ext.y <= y < ext.y + ext.height):
+                    continue
+                hit = comp.get_accessible_at_point(x, y, Atspi.CoordType.SCREEN)
+                if hit is not None:
+                    break
+
+            if hit is None:
+                continue
+
+            # get_accessible_at_point isn't guaranteed to return the
+            # deepest leaf on every toolkit -- recurse a bounded number
+            # of times until it stops making progress.
+            depth = 0
+            current = hit
+            while depth < MAX_DESCEND_DEPTH:
+                comp = current.get_component_iface()
+                if comp is None:
+                    break
+                nxt = comp.get_accessible_at_point(x, y, Atspi.CoordType.SCREEN)
+                if nxt is None or nxt == current:
+                    break
+                current = nxt
+                depth += 1
+
+            name = current.get_name() or ""
+            role = current.get_role_name() or ""
+            try:
+                description = current.get_description() or ""
+            except Exception:
+                description = ""
+            if not name and not description:
+                continue
+            return {"tier": "atspi", "name": name, "role": role, "detail": description}
+        except Exception:
+            _record_failure(key)
+            continue
+    return None
+
+
+# --- Tier 2: Hyprland window-at-point ------------------------------------
+
+def window_hit(x, y):
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=0.3)
+        clients = json.loads(out.stdout)
+    except Exception:
+        return None
+
+    candidates = []
+    for c in clients:
+        if c.get("hidden"):
+            continue
+        try:
+            cx, cy = c["at"]
+            cw, ch = c["size"]
+        except Exception:
+            continue
+        if cx <= x < cx + cw and cy <= y < cy + ch:
+            candidates.append(c)
+    if not candidates:
+        return None
+    # No real z-order data from this call -- lowest focusHistoryID is a
+    # cheap "most recently focused" heuristic, not a true topmost test.
+    candidates.sort(key=lambda c: c.get("focusHistoryID", 999))
+    c = candidates[0]
+    return {"tier": "window", "name": c.get("class", ""), "role": "", "detail": c.get("title", "")}
+
+
+def resolve(x, y):
+    hit = atspi_hit(x, y)
+    if hit:
+        hit["x"], hit["y"] = x, y
+        return hit
+    hit = window_hit(x, y)
+    if hit:
+        hit["x"], hit["y"] = x, y
+        return hit
+    return {"tier": "none", "name": "", "role": "", "detail": "", "x": x, "y": y}
+
+
+def main():
+    last_emitted = None
+    while True:
+        start = time.time()
+        pos = cursor_pos()
+        if pos is not None:
+            x, y = pos
+            result = resolve(x, y)
+            key = (result["tier"], result["name"], result["role"], result["detail"])
+            if key != last_emitted:
+                last_emitted = key
+                print(json.dumps(result), flush=True)
+        elapsed = time.time() - start
+        time.sleep(max(0.0, POLL_INTERVAL - elapsed))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
