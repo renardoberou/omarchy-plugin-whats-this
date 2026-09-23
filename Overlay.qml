@@ -17,9 +17,12 @@ Item {
 
   property var shell: null
   property var manifest: null
-  property var bar: null
+  // The shell hands overlays their plugin's service directly (and a scoped
+  // `shell`), never a `bar` -- v0.1 read `bar.shell`, which is always null
+  // here, so the card could never appear.
+  property var service: null
 
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("renardoberou.help") : null
+  readonly property var svc: service || (shell ? shell.serviceFor("renardoberou.help") : null)
   readonly property var hover: svc ? svc.hover : ({ tier: "none", name: "", role: "", detail: "", x: 0, y: 0 })
   readonly property bool showing: !!(svc && svc.active && Model.hasContent(hover))
 

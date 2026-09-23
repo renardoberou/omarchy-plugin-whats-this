@@ -29,16 +29,6 @@ BarWidget {
       font.pixelSize: Style.font.body
       anchors.verticalCenter: parent.verticalCenter
     }
-
-    Text {
-      textFormat: Text.PlainText
-      text: "Help"
-      visible: !root.bar.vertical
-      color: root.active ? (root.bar ? root.bar.urgent : Color.urgent) : root.bar.barForeground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.body
-      anchors.verticalCenter: parent.verticalCenter
-    }
   }
 
   MouseArea {
