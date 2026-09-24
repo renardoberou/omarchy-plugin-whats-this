@@ -7,15 +7,15 @@ import "Model.js" as Model
 // bar pill reports. Overlay.qml draws whatever `card` holds.
 //
 // IPC:
-//   omarchy-shell renardoberou.help toggle      # or: on / off
-//   omarchy-shell renardoberou.help status | jq
-//   omarchy-shell renardoberou.help inspectBar 1690 10   # the card for a bar point
+//   omarchy-shell renardoberou.whats-this toggle      # or: on / off
+//   omarchy-shell renardoberou.whats-this status | jq
+//   omarchy-shell renardoberou.whats-this inspectBar 1690 10   # the card for a bar point
 Item {
   id: root
   property var shell: null
 
   readonly property string helperDir: Qt.resolvedUrl("bin").toString().replace(/^file:\/\//, "")
-  readonly property string daemonPath: helperDir + "/omarchy-help-daemon"
+  readonly property string daemonPath: helperDir + "/omarchy-whats-this"
 
   property bool active: false
   property bool stateLoaded: false
@@ -100,7 +100,7 @@ Item {
       onRead: function(line) { root.handleLine(line) }
     }
     onExited: function(exitCode, exitStatus) {
-      // Runs until stopped; if it dies while Help is on, restart it after a
+      // Runs until stopped; if it dies while it is on, restart it after a
       // short pause (the `running` binding alone won't re-fire).
       root.card = null
       if (root.active) {
@@ -117,12 +117,12 @@ Item {
   }
 
   IpcHandler {
-    target: "renardoberou.help"
+    target: "renardoberou.whats-this"
     function toggle(): string { root.toggle(); return root.active ? "on" : "off" }
     function on(): string { root.setActive(true); return "on" }
     function off(): string { root.setActive(false); return "off" }
     // What a card at global (x, y) on the bar would say, without showing it
-    // (scripts, tests). Needs Help on so the bars report their widgets.
+    // (scripts, tests). Needs it switched on so the bars report their widgets.
     function inspectBar(x: int, y: int): string {
       var hit = Model.barHit(root.allBarRects(), x, y)
       return JSON.stringify(hit ? { widget: hit.m, rect: hit, card: Model.barCard(hit.m, root.catalog) } : null)

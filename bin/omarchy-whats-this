@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # NOTE: the system interpreter on purpose -- a `python3` on PATH may be a
 # version manager's build. Only the standard library is used.
-"""omarchy-help-daemon -- tooltip-style help for whatever the pointer rests on.
+"""omarchy-whats-this -- tooltip-style help for whatever the pointer rests on.
 
 Emits one JSON line per event to stdout for Service.qml:
 
@@ -40,7 +40,7 @@ HOME = os.path.expanduser("~")
 
 
 def log(*args):
-    print("[help]", *args, file=sys.stderr, flush=True)
+    print("[whats-this]", *args, file=sys.stderr, flush=True)
 
 
 def emit(obj):
@@ -450,7 +450,7 @@ def load_widgets():
 def main():
     if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         log("not running under Hyprland")
-        emit({"kind": "error", "message": "Help needs Hyprland."})
+        emit({"kind": "error", "message": "What's This needs Hyprland."})
         return
     state = State()
     threading.Thread(target=listen_events, args=(state,), daemon=True).start()
@@ -492,8 +492,14 @@ def main():
 
 def state_cmd(args):
     """--state [on|off]: read or persist the bar toggle."""
-    d = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "omarchy-help")
+    d = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "omarchy-whats-this")
     f = os.path.join(d, "active")
+    # carry the toggle over from the plugin's old name ("Help", v0.1-v0.2)
+    old = os.path.join(os.path.dirname(d), "omarchy-help", "active")
+    if not os.path.exists(f) and os.path.exists(old):
+        os.makedirs(d, exist_ok=True)
+        with open(old) as src, open(f, "w") as dst:
+            dst.write(src.read())
     if args and args[0] in ("on", "off"):
         os.makedirs(d, exist_ok=True)
         with open(f, "w") as fh:

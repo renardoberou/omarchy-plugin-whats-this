@@ -1,4 +1,4 @@
-// Pure logic for Help: daemon lines, bar-widget hit testing and cards,
+// Pure logic for What's This: daemon lines, bar-widget hit testing and cards,
 // key-chip formatting and card placement. No I/O -- loads in Quickshell and
 // in plain node (`node --test tests/*.test.js`).
 

@@ -17,7 +17,7 @@ Item {
   // Overlays receive their plugin's service directly -- never a `bar`.
   property var service: null
 
-  readonly property var svc: service || (shell ? shell.serviceFor("renardoberou.help") : null)
+  readonly property var svc: service || (shell ? shell.serviceFor("renardoberou.whats-this") : null)
   readonly property var card: svc ? svc.card : null
   readonly property bool showing: !!(svc && svc.active && card)
   readonly property var where: card ? Model.screenAt(Quickshell.screens, card.x, card.y)
@@ -33,7 +33,7 @@ Item {
     visible: root.showing || box.opacity > 0.001
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "omarchy-help"
+    WlrLayershell.namespace: "omarchy-whats-this"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore

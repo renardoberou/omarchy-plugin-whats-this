@@ -1,7 +1,9 @@
-# Help
+# What's This
+
+![What's This: the card for a bar icon, with its description and shortcuts](preview.png)
 
 Point at anything in Omarchy and learn what it is — and how to do it from the
-keyboard. Turn Help on from the bar, then rest the pointer:
+keyboard. Switch it on from the bar (the **?** icon), then rest the pointer:
 
 - **on a window** — the app's name and what it is (from its desktop entry,
   web apps included), the shortcut that opens it, and what you can do with
@@ -25,19 +27,29 @@ Hyprland reloads its config.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/renardoberou/omarchy-plugin-help --enable
+omarchy plugin add https://github.com/renardoberou/omarchy-plugin-whats-this --enable
 ```
 
 Needs nothing beyond a standard Omarchy system (Hyprland, the `omarchy` CLI,
 and the system `python3`, standard library only).
 
-## Remove
+## Upgrading from Help
+
+This plugin was called **Help** (`renardoberou.help`) until v0.3.0. Remove
+the old one and add What's This; the on/off setting carries over:
 
 ```bash
 omarchy plugin remove renardoberou.help
+omarchy plugin add https://github.com/renardoberou/omarchy-plugin-whats-this --enable
 ```
 
-Its only state is `~/.local/state/omarchy-help/active` (the toggle).
+## Remove
+
+```bash
+omarchy plugin remove renardoberou.whats-this
+```
+
+Its only state is `~/.local/state/omarchy-whats-this/active` (the toggle).
 
 ## Cost
 
@@ -50,15 +62,15 @@ after Hyprland announces a change. (v0.1 spent 13–18% of a core.)
 ## IPC
 
 ```bash
-omarchy-shell renardoberou.help toggle            # or: on / off
-omarchy-shell renardoberou.help status | jq
-omarchy-shell renardoberou.help inspectBar 1690 10  # what the card for that bar point says
+omarchy-shell renardoberou.whats-this toggle            # or: on / off
+omarchy-shell renardoberou.whats-this status | jq
+omarchy-shell renardoberou.whats-this inspectBar 1690 10  # what the card for that bar point says
 ```
 
 ## How bar-icon help works
 
-Plugins get no API that says which widget is under the pointer. Help's own
-bar pill lives *inside* the bar, though, so while Help is on it looks at the
+Plugins get no API that says which widget is under the pointer. This plugin's own
+bar pill lives *inside* the bar, though, so while it is on it looks at the
 widgets next to it — each Omarchy bar widget carries a `moduleName` and knows
 its place on screen — and reports their rectangles, taking into account
 parents that hide or clip them. Names and descriptions come from each
@@ -70,7 +82,7 @@ falls back to saying nothing rather than something wrong.
 
 ## Known limits
 
-- Help describes the *window* under the pointer, not individual buttons
+- It describes the *window* under the pointer, not individual buttons
   inside apps: Wayland apps don't expose their controls to other programs in
   a way that works reliably (v0.1 tried the accessibility bus; on this
   machine almost no app published anything).
@@ -87,7 +99,7 @@ Service.qml             toggle (persisted), daemon, bar rectangles, IPC
 BarWidget.qml           bar toggle (?) and the bar-widget rectangle reporter
 Overlay.qml             click-through tooltip card with key chips
 Model.js                pure: key chips, bar hit-test, bar-widget cards, placement
-bin/omarchy-help-daemon pointer dwell, Hyprland IPC, keybindings, app identity, cards
+bin/omarchy-whats-this  pointer dwell, Hyprland IPC, keybindings, app identity, cards
 tests/                  node tests (Model.js), python tests (daemon)
 ```
 
@@ -95,8 +107,8 @@ tests/                  node tests (Model.js), python tests (daemon)
 
 ```bash
 omarchy plugin validate .
-ln -sfn "$PWD" ~/.config/omarchy/plugins/renardoberou.help
-omarchy plugin enable renardoberou.help
+ln -sfn "$PWD" ~/.config/omarchy/plugins/renardoberou.whats-this
+omarchy plugin enable renardoberou.whats-this
 omarchy restart shell          # edits in a symlinked checkout need a restart
 node --test tests/*.test.js
 python3 -m unittest discover -s tests

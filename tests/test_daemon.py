@@ -2,7 +2,7 @@
 import importlib.machinery, importlib.util, os, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-loader = importlib.machinery.SourceFileLoader("helpd", os.path.join(HERE, "..", "bin", "omarchy-help-daemon"))
+loader = importlib.machinery.SourceFileLoader("helpd", os.path.join(HERE, "..", "bin", "omarchy-whats-this"))
 spec = importlib.util.spec_from_loader("helpd", loader)
 d = importlib.util.module_from_spec(spec)
 loader.exec_module(d)

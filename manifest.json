@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "renardoberou.help",
-  "name": "Help",
-  "version": "0.2.0",
+  "id": "renardoberou.whats-this",
+  "name": "What's This",
+  "version": "0.3.0",
   "author": "Bernardo Roustand",
   "license": "MIT",
   "description": "Rest the pointer on a window, a bar icon or the desktop and see what it is and its keyboard shortcuts, read live from your Omarchy keybindings.",
@@ -18,7 +18,7 @@
     "overlay": "Overlay.qml"
   },
   "barWidget": {
-    "displayName": "Help",
+    "displayName": "What's This",
     "description": "Point at anything to see what it is and its shortcuts.",
     "category": "System",
     "allowMultiple": false,

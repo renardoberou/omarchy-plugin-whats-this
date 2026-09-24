@@ -5,13 +5,13 @@ import qs.Commons
 
 BarWidget {
   id: root
-  moduleName: "renardoberou.help"
+  moduleName: "renardoberou.whats-this"
 
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("renardoberou.help") : null
+  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("renardoberou.whats-this") : null
   readonly property bool active: svc ? svc.active : false
   readonly property string tip: active
-    ? "Help — on. Rest the pointer on anything to see what it is and its shortcuts. Click to turn off."
-    : "Help — off. Click, then rest the pointer on a window, the desktop or a bar icon."
+    ? "What's This — on. Rest the pointer on anything to see what it is and its shortcuts. Click to turn off."
+    : "What's This — off. Click, then rest the pointer on a window, the desktop or a bar icon."
 
   implicitWidth: pillRow.implicitWidth + Style.space(14)
   implicitHeight: barSize
@@ -43,7 +43,7 @@ BarWidget {
 
   // Bar-icon help: this pill lives inside the bar, so it can see every
   // widget next to it -- each carries a `moduleName` and knows where it is on
-  // screen. While Help is on, report this bar's widget rectangles to the
+  // screen. While it is on, report this bar's widget rectangles to the
   // service, which hit-tests them when the pointer rests on the bar. (The
   // shell gives plugins no API for this; it relies on bar widgets keeping
   // their `moduleName`, which every Omarchy bar widget has.)
