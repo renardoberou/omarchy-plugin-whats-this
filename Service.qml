@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
@@ -10,6 +11,8 @@ import "Model.js" as Model
 //   omarchy-shell renardoberou.whats-this toggle      # or: on / off
 //   omarchy-shell renardoberou.whats-this status | jq
 //   omarchy-shell renardoberou.whats-this inspectBar 1690 10   # the card for a bar point
+//   omarchy-shell renardoberou.whats-this coachToggle        # or: coachOn / coachOff
+//   omarchy-shell renardoberou.whats-this coachReset         # forget what Coach has learned
 Item {
   id: root
   property var shell: null
@@ -24,6 +27,17 @@ Item {
   property var barRects: ({})
   property var card: null
   property int cardSeq: 0
+
+  // Coach: tips when you do something the long way (clicking a workspace
+  // on the bar, opening an app from the menu). Its own switch, persisted
+  // together with what it has learned.
+  property bool coachOn: false
+  property bool coachLoaded: false
+  property var coachState: Model.coachState(null)
+  property var tip: null
+  property int tipSeq: 0
+  readonly property string coachPath: Quickshell.env("HOME") + "/.local/state/omarchy-whats-this/coach.json"
+  readonly property bool daemonWanted: root.stateLoaded && root.coachLoaded && (root.active || root.coachOn)
   property string lastError: ""
 
   function setActive(on) {
@@ -32,7 +46,43 @@ Item {
     if (!on) root.card = null
     stateWriter.command = [root.daemonPath, "--state", on ? "on" : "off"]
     stateWriter.running = true
+    syncDaemon()
   }
+
+  function setCoach(on) {
+    if (root.coachOn === on) return
+    root.coachOn = on
+    if (!on) root.tip = null
+    saveCoach()
+    syncDaemon()
+  }
+
+  function resetCoach() {
+    root.coachState = Model.coachState(null)
+    saveCoach()
+  }
+
+  function saveCoach() {
+    var o = { on: root.coachOn }
+    for (var k in root.coachState) o[k] = root.coachState[k]
+    coachFile.setText(JSON.stringify(o, null, 2) + "\n")
+  }
+
+  // Start, stop or restart the helper so it runs with the modes that are on.
+  function syncDaemon() {
+    var cmd = [root.daemonPath, "--hover", root.active ? "1" : "0", "--coach", root.coachOn ? "1" : "0"]
+    if (daemon.running) {
+      if (!root.daemonWanted || String(daemon.command) !== String(cmd)) {
+        root.pendingCommand = root.daemonWanted ? cmd : null
+        daemon.running = false          // onExited starts it again with the new flags
+      }
+    } else if (root.daemonWanted) {
+      daemon.command = cmd
+      daemon.running = true
+    }
+  }
+  property var pendingCommand: null
+  onDaemonWantedChanged: syncDaemon()
   function toggle() { setActive(!root.active) }
 
   // Called by each bar's pill with the widgets it can see in that bar.
@@ -70,7 +120,17 @@ Item {
       c.x = d.x; c.y = d.y
       show(c)
     } else if (d.kind === "window" || d.kind === "desktop") {
-      show(d)
+      if (root.active) show(d)
+    } else if (d.kind === "coach") {
+      if (!root.coachOn) return
+      var r = Model.coachDecide(root.coachState, d, root.allBarRects(), root.catalog, Date.now())
+      root.coachState = r.state
+      saveCoach()
+      if (r.tip) {
+        root.tip = r.tip
+        root.tipSeq++
+        tipTimer.restart()
+      }
     }
   }
 
@@ -95,16 +155,16 @@ Item {
   Process {
     id: daemon
     command: [root.daemonPath]
-    running: root.active && root.stateLoaded
     stdout: SplitParser {
       onRead: function(line) { root.handleLine(line) }
     }
     onExited: function(exitCode, exitStatus) {
-      // Runs until stopped; if it dies while it is on, restart it after a
-      // short pause (the `running` binding alone won't re-fire).
       root.card = null
-      if (root.active) {
-        daemon.running = false
+      if (root.pendingCommand) {          // stopped by syncDaemon to change modes
+        daemon.command = root.pendingCommand
+        root.pendingCommand = null
+        Qt.callLater(function() { daemon.running = true })
+      } else if (root.daemonWanted) {     // died on its own: retry after a pause
         restartTimer.restart()
       }
     }
@@ -113,7 +173,28 @@ Item {
   Timer {
     id: restartTimer
     interval: 1500
-    onTriggered: if (root.active) daemon.running = true
+    onTriggered: root.syncDaemon()
+  }
+
+  Timer {
+    id: tipTimer
+    interval: 8000
+    onTriggered: root.tip = null
+  }
+
+  FileView {
+    id: coachFile
+    path: root.coachPath
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      var o = {}
+      try { o = JSON.parse(text()) || {} } catch (e) { o = {} }
+      root.coachOn = o.on === true
+      root.coachState = Model.coachState(o)
+      root.coachLoaded = true
+    }
+    onLoadFailed: function(error) { root.coachLoaded = true }
   }
 
   IpcHandler {
@@ -126,6 +207,20 @@ Item {
     function inspectBar(x: int, y: int): string {
       var hit = Model.barHit(root.allBarRects(), x, y)
       return JSON.stringify(hit ? { widget: hit.m, rect: hit, card: Model.barCard(hit.m, root.catalog) } : null)
+    }
+    function coachToggle(): string { root.setCoach(!root.coachOn); return root.coachOn ? "coach on" : "coach off" }
+    function coachOn(): string { root.setCoach(true); return "coach on" }
+    function coachOff(): string { root.setCoach(false); return "coach off" }
+    function coachReset(): string { root.resetCoach(); return "coach reset" }
+    // Feed Coach an event as if the helper had reported it (testing and
+    // scripting): '{"kind":"coach","event":"workspace","name":"2","x":1540,"y":780,"overBar":true}'
+    function coachSimulate(eventJson: string): string {
+      if (!root.coachOn) return "coach is off"
+      root.handleLine(eventJson)
+      return root.tip ? root.tip.title : "no tip"
+    }
+    function coachStatus(): string {
+      return JSON.stringify({ on: root.coachOn, state: root.coachState, tip: root.tip, tipSeq: root.tipSeq })
     }
     function status(): string {
       return JSON.stringify({

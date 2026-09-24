@@ -15,6 +15,14 @@ Emits one JSON line per event to stdout for Service.qml:
       rectangle (reported by the bar pill) and builds that card itself
   {"kind":"hide"}
       the pointer moved away
+  {"kind":"coach", "event":"workspace", "name", "x","y", "overBar"}
+  {"kind":"coach", "event":"app-opened", "class","app","viaMenu","launch":{keys,label}|null, "x","y"}
+      Coach mode: moments where a shortcut would have done the job. Service
+      (Model.coachDecide) turns them into tips -- or counts them as the
+      shortcut being used, and retires the tip. Only Hyprland's own event
+      socket is used: Coach never sees a keystroke.
+
+Usage: omarchy-whats-this [--hover 0|1] [--coach 0|1]   (defaults: hover on, coach off)
 
 Cost: v0.1 spawned up to three `hyprctl` processes 12 times a second and
 walked the accessibility tree (~13-18% of a core). This talks to Hyprland's
@@ -43,9 +51,14 @@ def log(*args):
     print("[whats-this]", *args, file=sys.stderr, flush=True)
 
 
+_emit_lock = threading.Lock()
+
+
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    # both the cursor loop and the event listener write here
+    with _emit_lock:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 # ---- Hyprland IPC ---------------------------------------------------------
@@ -106,9 +119,10 @@ class State:
         self.fetched = time.monotonic()
 
 
-def listen_events(state):
+def listen_events(state, on_event=None):
     """Hyprland's event socket: any window/layer/monitor change marks the
-    cache stale; a config reload also re-reads the keybindings."""
+    cache stale; a config reload also re-reads the keybindings. `on_event`
+    (Coach) gets every (name, data) pair."""
     while True:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -121,8 +135,13 @@ def listen_events(state):
                     buf += b
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        ev = line.split(b">>", 1)[0].decode("ascii", "replace")
-                        state.mark(binds=(ev == "configreloaded"))
+                        name, _, data = line.decode("utf-8", "replace").partition(">>")
+                        state.mark(binds=(name == "configreloaded"))
+                        if on_event:
+                            try:
+                                on_event(name, data)
+                            except Exception as exc:     # never let Coach kill the listener
+                                log("coach:", exc)
         except Exception:
             pass
         time.sleep(2)
@@ -447,17 +466,85 @@ def load_widgets():
         return {}
 
 
+# ---- Coach ---------------------------------------------------------------------
+
+MENU_NAMESPACE = "omarchy-menu"
+MENU_WINDOW_S = 6.0      # a window opening this soon after the menu closed came from the menu
+
+
+class Coach:
+    """Turns Hyprland events into 'you did that the long way' facts. It keeps
+    no history beyond the last menu close; deciding what to say (and when to
+    stop saying it) is Model.coachDecide's job in the shell."""
+
+    def __init__(self, state, ctx):
+        self.state = state
+        self.ctx = ctx                 # dict: apps, binds, launchers, term, browser
+        self.menu_open = False
+        self.menu_closed_at = -1e9
+
+    def pointer(self):
+        pos = hypr("cursorpos") or {}
+        return int(pos.get("x", 0)), int(pos.get("y", 0))
+
+    def on_event(self, name, data, now=None):
+        now = time.monotonic() if now is None else now
+        if name == "openlayer" and data == MENU_NAMESPACE:
+            self.menu_open = True
+        elif name == "closelayer" and data == MENU_NAMESPACE:
+            self.menu_open = False
+            self.menu_closed_at = now
+        elif name == "workspacev2":
+            ws = data.split(",", 1)[-1]
+            x, y = self.pointer()
+            self.state.mark()
+            self.state.refresh()
+            emit({"kind": "coach", "event": "workspace", "name": ws, "x": x, "y": y,
+                  "overBar": over_bar(self.state.layers, x, y)})
+        elif name == "openwindow":
+            parts = data.split(",", 3)
+            if len(parts) < 3:
+                return
+            cls = parts[2]
+            via_menu = self.menu_open or (now - self.menu_closed_at) <= MENU_WINDOW_S
+            c = self.ctx
+            app = c["apps"].identify(cls)
+            launch = None
+            for l in c["launchers"]:
+                if l["desc"] in c["binds"] and launcher_matches(l, app, cls, c["term"], c["browser"]):
+                    launch = {"keys": c["binds"][l["desc"]], "label": l["desc"]}
+                    break
+            x, y = self.pointer()
+            emit({"kind": "coach", "event": "app-opened", "class": cls,
+                  "app": (app or {}).get("Name") or cls, "viaMenu": via_menu,
+                  "launch": launch, "x": x, "y": y})
+
+
+def parse_args(argv):
+    opts = {"hover": True, "coach": False}
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--hover", "--coach") and i + 1 < len(argv):
+            opts[argv[i][2:]] = argv[i + 1] not in ("0", "off", "false")
+            i += 2
+        else:
+            i += 1
+    return opts
+
+
 def main():
     if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         log("not running under Hyprland")
         emit({"kind": "error", "message": "What's This needs Hyprland."})
         return
+    opts = parse_args(sys.argv[1:])
     state = State()
-    threading.Thread(target=listen_events, args=(state,), daemon=True).start()
-
     apps = Apps()
     term, browser = default_terminal(), default_browser()
     binds, launchers = load_binds(), load_launchers()
+    ctx = {"apps": apps, "binds": binds, "launchers": launchers, "term": term, "browser": browser}
+    coach = Coach(state, ctx) if opts["coach"] else None
+    threading.Thread(target=listen_events, args=(state, coach.on_event if coach else None), daemon=True).start()
     emit({"kind": "catalog", "binds": binds, "widgets": load_widgets()})
 
     anchor, still_since, shown = None, 0.0, False
@@ -466,7 +553,12 @@ def main():
         if state.reload_binds:
             state.reload_binds = False
             binds, launchers = load_binds(), load_launchers()
+            ctx["binds"], ctx["launchers"] = binds, launchers
             emit({"kind": "catalog", "binds": binds, "widgets": load_widgets()})
+        if not opts["hover"]:
+            # Coach only: everything happens in the event listener
+            time.sleep(0.5)
+            continue
 
         pos = hypr("cursorpos")
         if pos and "x" in pos:
@@ -494,6 +586,7 @@ def state_cmd(args):
     """--state [on|off]: read or persist the bar toggle."""
     d = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "omarchy-whats-this")
     f = os.path.join(d, "active")
+    os.makedirs(d, exist_ok=True)       # coach.json lives here too
     # carry the toggle over from the plugin's old name ("Help", v0.1-v0.2)
     old = os.path.join(os.path.dirname(d), "omarchy-help", "active")
     if not os.path.exists(f) and os.path.exists(old):

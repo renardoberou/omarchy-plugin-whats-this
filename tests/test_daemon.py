@@ -118,3 +118,58 @@ class Cards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoachEvents(unittest.TestCase):
+    """The Coach reads only Hyprland events; hypr() and emit() are stubbed."""
+
+    def setUp(self):
+        self.out = []
+        self._emit, self._hypr = d.emit, d.hypr
+        d.emit = lambda o: self.out.append(o)
+        d.hypr = lambda cmd, as_json=True: {"x": 1600, "y": 10} if cmd == "cursorpos" else None
+
+        class St:
+            layers = {"HDMI-A-1": {"levels": {"2": [{"namespace": "omarchy-bar", "x": 1536, "y": 0, "w": 1360, "h": 26}]}}}
+            def mark(self, binds=False): pass
+            def refresh(self): pass
+
+        class FakeApps:
+            def identify(self, cls, initial=""):
+                return {"id": "com.mitchellh.ghostty", "Name": "Ghostty"} if "ghostty" in cls else None
+
+        binds = d.parse_bind_printer(PRINTER)
+        self.coach = d.Coach(St(), {"apps": FakeApps(), "binds": binds, "launchers": d.parse_lua_launchers(LUA),
+                                    "term": "com.mitchellh.ghostty", "browser": "google-chrome"})
+
+    def tearDown(self):
+        d.emit, d.hypr = self._emit, self._hypr
+
+    def test_workspace_switch_reports_pointer_over_bar(self):
+        self.coach.on_event("workspacev2", "2,2", now=10)
+        self.assertEqual(self.out[-1]["event"], "workspace")
+        self.assertEqual(self.out[-1]["name"], "2")
+        self.assertTrue(self.out[-1]["overBar"])
+
+    def test_window_after_menu_is_via_menu_with_its_shortcut(self):
+        self.coach.on_event("openlayer", "omarchy-menu", now=10)
+        self.coach.on_event("closelayer", "omarchy-menu", now=11)
+        self.coach.on_event("openwindow", "abc,1,com.mitchellh.ghostty,~", now=12)
+        e = self.out[-1]
+        self.assertTrue(e["viaMenu"])
+        self.assertEqual(e["app"], "Ghostty")
+        self.assertEqual(e["launch"], {"keys": "SUPER + RETURN", "label": "Terminal"})
+
+    def test_window_long_after_menu_is_not_via_menu(self):
+        self.coach.on_event("closelayer", "omarchy-menu", now=11)
+        self.coach.on_event("openwindow", "abc,1,com.mitchellh.ghostty,~", now=30)
+        self.assertFalse(self.out[-1]["viaMenu"])
+
+    def test_other_layers_are_ignored(self):
+        self.coach.on_event("openlayer", "omarchy-typewriter", now=10)
+        self.coach.on_event("openwindow", "abc,1,com.mitchellh.ghostty,~", now=10.5)
+        self.assertFalse(self.out[-1]["viaMenu"])
+
+    def test_args(self):
+        self.assertEqual(d.parse_args(["--hover", "0", "--coach", "1"]), {"hover": False, "coach": True})
+        self.assertEqual(d.parse_args([]), {"hover": True, "coach": False})

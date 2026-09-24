@@ -119,6 +119,91 @@ function barCard(module, catalog) {
   }
 }
 
+// ---- Coach ------------------------------------------------------------------
+//
+// The daemon reports moments where a shortcut would have done the job --
+// clicking a workspace number on the bar, opening an app from the menu --
+// and also the same things done without the mouse. This decides: show a
+// tip, count the shortcut as used, or stay quiet. A tip retires once its
+// shortcut has been used twice, is shown at most three times, and tips are
+// spaced out so Coach never nags.
+
+var COACH = { cooldownMs: 3 * 60 * 1000, maxPerDay: 8, maxShows: 3, learnedAfter: 2 }
+
+function coachState(raw) {
+  var s = raw && typeof raw === "object" ? raw : {}
+  return { learned: s.learned || {}, shown: s.shown || {}, lastTipAt: Number(s.lastTipAt) || 0,
+           day: String(s.day || ""), dayCount: Number(s.dayCount) || 0 }
+}
+
+function dayOf(ms) {
+  var d = new Date(ms)
+  return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate()
+}
+
+function copyState(st) {
+  var o = coachState(JSON.parse(JSON.stringify(st)))
+  return o
+}
+
+// -> { state, tip } ; tip is null when there's nothing to say
+function coachDecide(state, ev, rects, catalog, nowMs) {
+  var st = copyState(coachState(state))
+  var binds = (catalog && catalog.binds) || {}
+  if (st.day !== dayOf(nowMs)) { st.day = dayOf(nowMs); st.dayCount = 0 }
+  if (!ev || ev.kind !== "coach") return { state: st, tip: null }
+
+  var key = "", slow = false, tip = null
+  if (ev.event === "workspace") {
+    key = "workspace"
+    var hit = ev.overBar ? barHit(rects, ev.x, ev.y) : null
+    if (hit && hit.m === "omarchy.workspaces") {
+      slow = true
+      var rows = []
+      var direct = binds["Switch to workspace " + ev.name]
+      if (direct) rows.push({ keys: direct, label: "Workspace " + ev.name })
+      var all = workspaceRow(binds)
+      if (all) rows.push(all)
+      if (binds["Next workspace"]) rows.push({ keys: binds["Next workspace"], label: "Next workspace" })
+      tip = { title: "Switch workspaces from the keyboard",
+              subtitle: "You clicked workspace " + ev.name + " on the bar. Next time:", rows: rows }
+    } else if (ev.overBar) {
+      return { state: st, tip: null }       // over some other bar widget: no signal
+    }
+  } else if (ev.event === "app-opened") {
+    if (!ev.launch || !ev.launch.keys) return { state: st, tip: null }
+    key = "launch:" + ev.launch.label
+    if (ev.viaMenu) {
+      slow = true
+      tip = { title: "Open " + (ev.app || ev.launch.label) + " in one keystroke",
+              subtitle: "You opened it from the menu. Next time:",
+              rows: [{ keys: ev.launch.keys, label: ev.launch.label }] }
+    }
+  } else {
+    return { state: st, tip: null }
+  }
+
+  if (!slow) {                                // did it the fast way: learning
+    st.learned[key] = (st.learned[key] || 0) + 1
+    return { state: st, tip: null }
+  }
+  var eligible = (st.learned[key] || 0) < COACH.learnedAfter &&
+                 (st.shown[key] || 0) < COACH.maxShows &&
+                 nowMs - st.lastTipAt >= COACH.cooldownMs &&
+                 st.dayCount < COACH.maxPerDay &&
+                 tip.rows.length > 0
+  if (!eligible) return { state: st, tip: null }
+  st.shown[key] = (st.shown[key] || 0) + 1
+  st.lastTipAt = nowMs
+  st.dayCount += 1
+  return {
+    state: st,
+    tip: { kind: "tip", key: key, title: tip.title, subtitle: tip.subtitle,
+           detail: "Coach · this tip stops once you've used the shortcut",
+           sections: [{ heading: "Shortcut", rows: tip.rows }], x: ev.x, y: ev.y }
+  }
+}
+
 // ---- placement --------------------------------------------------------------
 
 function screenAt(screens, gx, gy) {
@@ -150,6 +235,9 @@ if (typeof module !== "undefined") {
     barCard: barCard,
     workspaceRow: workspaceRow,
     screenAt: screenAt,
+    coachDecide: coachDecide,
+    coachState: coachState,
+    COACH: COACH,
     placeCard: placeCard,
     INDICATORS: INDICATORS
   }

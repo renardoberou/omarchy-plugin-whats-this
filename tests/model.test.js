@@ -89,3 +89,72 @@ test("daemon lines parse; junk doesn't", () => {
   assert.equal(M.parseLine("nope"), null)
   assert.equal(M.parseLine('{"x":1}'), null)
 })
+
+// ---- Coach ----
+
+const wsRects = [{ m: "omarchy.workspaces", x: 1571, y: 0, w: 106, h: 26, vis: true },
+                 { m: "omarchy.clock", x: 2189, y: 0, w: 53, h: 26, vis: true }]
+const T0 = Date.UTC(2026, 8, 24, 10, 0, 0)
+const click = { kind: "coach", event: "workspace", name: "2", x: 1600, y: 10, overBar: true }
+const keys = { kind: "coach", event: "workspace", name: "2", x: 900, y: 500, overBar: false }
+const viaMenu = { kind: "coach", event: "app-opened", app: "Ghostty", viaMenu: true,
+                  launch: { keys: "SUPER + RETURN", label: "Terminal" }, x: 500, y: 500 }
+const direct = Object.assign({}, viaMenu, { viaMenu: false })
+
+test("clicking a workspace on the bar gets the keyboard tip", () => {
+  const r = M.coachDecide(null, click, wsRects, catalog, T0)
+  assert.equal(r.tip.title, "Switch workspaces from the keyboard")
+  assert.deepEqual(r.tip.sections[0].rows[0], { keys: "SUPER + 2", label: "Workspace 2" })
+  assert.equal(r.tip.sections[0].rows[1].keys, "SUPER + 1…0")
+  assert.equal(r.state.shown.workspace, 1)
+})
+
+test("opening an app from the menu gets its launch shortcut", () => {
+  const r = M.coachDecide(null, viaMenu, [], catalog, T0)
+  assert.equal(r.tip.title, "Open Ghostty in one keystroke")
+  assert.deepEqual(r.tip.sections[0].rows, [{ keys: "SUPER + RETURN", label: "Terminal" }])
+})
+
+test("tips are spaced out (cooldown) and capped per day", () => {
+  let r = M.coachDecide(null, click, wsRects, catalog, T0)
+  let r2 = M.coachDecide(r.state, viaMenu, [], catalog, T0 + 60 * 1000)
+  assert.equal(r2.tip, null)                                  // 1 min later: too soon
+  r2 = M.coachDecide(r.state, viaMenu, [], catalog, T0 + M.COACH.cooldownMs)
+  assert.ok(r2.tip)
+  let st = r2.state; st.dayCount = M.COACH.maxPerDay
+  assert.equal(M.coachDecide(st, click, wsRects, catalog, T0 + 10 * M.COACH.cooldownMs).tip, null)
+})
+
+test("a tip is shown at most three times", () => {
+  let st = null, n = 0
+  for (let i = 0; i < 6; i++) {
+    const r = M.coachDecide(st, click, wsRects, catalog, T0 + i * M.COACH.cooldownMs)
+    if (r.tip) n++
+    st = r.state
+  }
+  assert.equal(n, M.COACH.maxShows)
+})
+
+test("using the shortcut twice retires the tip", () => {
+  let r = M.coachDecide(null, keys, wsRects, catalog, T0)
+  assert.equal(r.tip, null)
+  r = M.coachDecide(r.state, keys, wsRects, catalog, T0 + 1)
+  assert.equal(r.state.learned.workspace, 2)
+  assert.equal(M.coachDecide(r.state, click, wsRects, catalog, T0 + M.COACH.cooldownMs).tip, null)
+  // opening Ghostty without the menu counts for the Terminal tip only
+  r = M.coachDecide(null, direct, [], catalog, T0)
+  assert.equal(r.state.learned["launch:Terminal"], 1)
+})
+
+test("no tip for apps without a launch shortcut, or clicks on other widgets", () => {
+  assert.equal(M.coachDecide(null, Object.assign({}, viaMenu, { launch: null }), [], catalog, T0).tip, null)
+  const clockClick = Object.assign({}, click, { x: 2200 })
+  const r = M.coachDecide(null, clockClick, wsRects, catalog, T0)
+  assert.equal(r.tip, null)
+  assert.equal(r.state.learned.workspace, undefined)          // not counted as keyboard use either
+})
+
+test("the day counter resets on a new day", () => {
+  let st = M.coachState({ day: "2026-9-23", dayCount: 8, lastTipAt: 0 })
+  assert.ok(M.coachDecide(st, click, wsRects, catalog, T0).tip)
+})

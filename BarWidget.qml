@@ -9,9 +9,15 @@ BarWidget {
 
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("renardoberou.whats-this") : null
   readonly property bool active: svc ? svc.active : false
-  readonly property string tip: active
+  readonly property bool coachOn: svc ? svc.coachOn : false
+  readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
+  readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+  property bool popupOpen: false
+  function close() { popupOpen = false }
+  readonly property string tip: (active
     ? "What's This — on. Rest the pointer on anything to see what it is and its shortcuts. Click to turn off."
-    : "What's This — off. Click, then rest the pointer on a window, the desktop or a bar icon."
+    : "What's This — off. Click, then rest the pointer on a window, the desktop or a bar icon.")
+    + (coachOn ? " Coach is on." : "") + " Right-click for Coach."
 
   implicitWidth: pillRow.implicitWidth + Style.space(14)
   implicitHeight: barSize
@@ -32,11 +38,23 @@ BarWidget {
     }
   }
 
+  // Coach is on: a small dot under the icon
+  Rectangle {
+    visible: root.coachOn
+    width: Style.space(4); height: width; radius: width / 2
+    anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: Style.space(2) }
+    color: root.bar ? root.bar.urgent : Color.urgent
+  }
+
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
-    onClicked: if (root.svc) root.svc.toggle()
+    acceptedButtons: Qt.LeftButton | Qt.RightButton
+    onClicked: function(mouse) {
+      if (mouse.button === Qt.RightButton) root.popupOpen = !root.popupOpen
+      else if (root.svc) root.svc.toggle()
+    }
     onEntered: if (root.bar) root.bar.showTooltip(root, root.tip)
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
@@ -84,12 +102,114 @@ BarWidget {
   Timer {
     interval: 1500
     repeat: true
-    running: root.active
+    running: root.active || root.coachOn
     triggeredOnStart: true
     onTriggered: {
       if (!root.svc) return
       var r = root.barWidgetRects()
       root.svc.setBarRects(r.key, r.rects)
+    }
+  }
+
+  PopupCard {
+    id: popup
+    anchorItem: root
+    bar: root.bar
+    owner: root
+    open: root.popupOpen
+    contentWidth: popup.fittedContentWidth(Style.space(330))
+    contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(320))
+
+    Column {
+      id: column
+      anchors.fill: parent
+      spacing: Style.space(2)
+
+      Text {
+        textFormat: Text.PlainText
+        text: "What's This"
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        bottomPadding: Style.space(6)
+      }
+
+      Repeater {
+        model: [
+          { key: "hover", label: "Point at anything", hint: "Rest the pointer to see what it is and its shortcuts" },
+          { key: "coach", label: "Coach", hint: "A tip when you do something the long way" }
+        ]
+        delegate: Rectangle {
+          required property var modelData
+          readonly property bool on: modelData.key === "hover" ? root.active : root.coachOn
+          width: column.width
+          height: rowCol.implicitHeight + Style.space(10)
+          radius: Style.space(3)
+          color: rowMouse.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08) : "transparent"
+
+          Column {
+            id: rowCol
+            anchors { left: parent.left; right: stateText.left; verticalCenter: parent.verticalCenter; leftMargin: Style.space(6); rightMargin: Style.space(8) }
+            Text {
+              textFormat: Text.PlainText
+              text: modelData.label
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: modelData.hint
+              wrapMode: Text.Wrap
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+          Text {
+            id: stateText
+            anchors { right: parent.right; verticalCenter: parent.verticalCenter; rightMargin: Style.space(6) }
+            textFormat: Text.PlainText
+            text: parent.on ? "on" : "off"
+            color: parent.on ? (root.bar ? root.bar.urgent : Color.urgent) : Qt.darker(root.fg, 1.5)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          MouseArea {
+            id: rowMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (root.svc) {
+              if (modelData.key === "hover") root.svc.toggle()
+              else root.svc.setCoach(!root.coachOn)
+            }
+          }
+        }
+      }
+
+      Text {
+        visible: root.coachOn
+        textFormat: Text.PlainText
+        text: "Forget what Coach has learned"
+        color: Qt.darker(root.fg, 1.4)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.underline: resetMouse.containsMouse
+        topPadding: Style.space(6)
+        leftPadding: Style.space(6)
+        MouseArea {
+          id: resetMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: if (root.svc) root.svc.resetCoach()
+        }
+      }
     }
   }
 }

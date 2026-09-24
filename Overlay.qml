@@ -18,8 +18,10 @@ Item {
   property var service: null
 
   readonly property var svc: service || (shell ? shell.serviceFor("renardoberou.whats-this") : null)
-  readonly property var card: svc ? svc.card : null
-  readonly property bool showing: !!(svc && svc.active && card)
+  // A Coach tip wins over a hover card, and shows whether or not hover help
+  // is on; it goes away on its own timer (Service), not when the pointer moves.
+  readonly property var card: svc ? (svc.tip || (svc.active ? svc.card : null)) : null
+  readonly property bool showing: !!card
   readonly property var where: card ? Model.screenAt(Quickshell.screens, card.x, card.y)
                                     : { screen: null, x: 0, y: 0 }
 
