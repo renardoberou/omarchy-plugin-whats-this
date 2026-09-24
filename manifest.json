@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "renardoberou.help",
   "name": "Help",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Bernardo Roustand",
   "license": "MIT",
-  "description": "Toggle on, then hover anything -- bar icons or app UI -- to see what it is and what it does, via AT-SPI where available.",
+  "description": "Rest the pointer on a window, a bar icon or the desktop and see what it is and its keyboard shortcuts, read live from your Omarchy keybindings.",
   "kinds": [
     "service",
     "bar-widget",
@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "Help",
-    "description": "Hover things to learn what they are.",
+    "description": "Point at anything to see what it is and its shortcuts.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

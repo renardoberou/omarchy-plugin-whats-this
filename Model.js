@@ -1,47 +1,156 @@
-// Pure logic for the Help plugin: parsing the daemon's JSON lines and
-// formatting them for display. No I/O — loads fine in Quickshell and in a
-// plain node test runner (`node -e "require('./Model.js').parseHoverLine(...)"`).
+// Pure logic for Help: daemon lines, bar-widget hit testing and cards,
+// key-chip formatting and card placement. No I/O -- loads in Quickshell and
+// in plain node (`node --test tests/*.test.js`).
 
-// Daemon emits one JSON line per resolved hover, tier in
-// ["bar", "atspi", "window", "none"]. Never throws — a malformed line
-// (partial write, daemon restart mid-line) degrades to a "none" hover
-// rather than taking the whole overlay down.
-function parseHoverLine(line) {
-  var fallback = { tier: "none", name: "", role: "", detail: "", x: 0, y: 0 };
-  if (!line) return fallback;
-  var parsed;
+function parseLine(line) {
   try {
-    parsed = JSON.parse(line);
+    var d = JSON.parse(String(line || ""))
+    return d && typeof d.kind === "string" ? d : null
   } catch (e) {
-    return fallback;
+    return null
   }
-  if (!parsed || typeof parsed !== "object") return fallback;
+}
+
+// ---- keys ------------------------------------------------------------------
+
+var KEY_NAMES = {
+  "SUPER": "Super", "SHIFT": "Shift", "CTRL": "Ctrl", "CONTROL": "Ctrl", "ALT": "Alt",
+  "RETURN": "Return", "ENTER": "Enter", "SPACE": "Space", "ESCAPE": "Esc", "TAB": "Tab",
+  "BACKSPACE": "Backspace", "DELETE": "Del", "Delete": "Del", "PRINT": "Print",
+  "HOME": "Home", "END": "End", "LEFT": "←", "RIGHT": "→", "UP": "↑", "DOWN": "↓",
+  "comma": ",", "COMMA": ",", "PERIOD": ".", "period": ".", "SLASH": "/", "MINUS": "-",
+  "EQUAL": "=", "mouse:272": "Left drag", "mouse:273": "Right drag",
+  "mouse_down": "Scroll ↓", "mouse_up": "Scroll ↑"
+}
+
+// "SUPER SHIFT + RETURN" -> ["Super", "Shift", "Return"];
+// "SUPER + 1…0" -> ["Super", "1–0"]; "XF86AudioPlay" -> ["Audio Play"].
+function keyChips(keys) {
+  var s = String(keys || "").trim()
+  if (!s) return []
+  var i = s.lastIndexOf(" + ")
+  var mods = i >= 0 ? s.slice(0, i).split(/\s+/) : []
+  var key = i >= 0 ? s.slice(i + 3) : s
+  function pretty(k) {
+    if (KEY_NAMES[k]) return KEY_NAMES[k]
+    if (/^XF86/.test(k)) return k.replace(/^XF86/, "").replace(/([a-z])([A-Z])/g, "$1 $2")
+    if (k.indexOf("…") >= 0) return k.split("…").map(pretty).join("–")
+    return k.length === 1 ? k.toUpperCase() : k.charAt(0) + k.slice(1).toLowerCase()
+  }
+  return mods.filter(function(m) { return m }).map(pretty).concat([pretty(key)])
+}
+
+// ---- bar widgets ------------------------------------------------------------
+
+// The small indicator icons inside omarchy.indicators aren't plugins, so
+// they have no catalog entry.
+var INDICATORS = {
+  "Dictation": { name: "Dictation", description: "Shows while voice dictation is listening.", binds: ["Toggle dictation"] },
+  "ScreenRecording": { name: "Screen recording", description: "Shows while the screen is being recorded.", binds: ["Screenrecording"] },
+  "Reminder": { name: "Reminder", description: "Shows when a reminder is set.", binds: ["Set reminder", "Show reminders"] },
+  "NightLight": { name: "Night light", description: "Shows while the night light is on.", binds: ["Toggle nightlight"] },
+  "Dnd": { name: "Do not disturb", description: "Shows while notifications are silenced.", binds: ["Toggle silencing notifications"] },
+  "StayAwake": { name: "Stay awake", description: "Shows while locking on idle is off.", binds: ["Toggle locking on idle"] }
+}
+
+// Keybindings that go with a bar widget, by binding description.
+var WIDGET_BINDS = {
+  "omarchy.menu": ["Omarchy menu", "Apps menu"],
+  "omarchy.workspaces": ["Next workspace", "Former workspace"],
+  "omarchy.audio": ["Audio", "Switch audio output"],
+  "omarchy.bluetooth": ["Bluetooth"],
+  "omarchy.network": ["Network"],
+  "omarchy.power": ["Power", "Toggle power profile"],
+  "omarchy.monitor": ["Display", "Toggle nightlight"],
+  "omarchy.clock": ["Calendar", "Show time"],
+  "omarchy.weather": ["Toggle weather"],
+  "omarchy.agents": ["Agent"],
+  "omarchy.microphone": ["Mute microphone"],
+  "omarchy.media": ["Play", "Next track", "Previous track"],
+  "renardoberou.gloss": ["Define selection"]
+}
+
+// The widget under (x, y): the smallest visible rectangle containing it, so
+// an indicator icon wins over the indicators strip around it. Rectangles
+// arrive parents-first, so on a tie (the strip showing exactly one icon is
+// the same size as that icon) the later, more specific one wins.
+function barHit(rects, x, y) {
+  var best = null
+  ;(rects || []).forEach(function(r) {
+    if (!r || !r.vis || r.w < 2 || r.h < 2) return
+    if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h) return
+    if (!best || r.w * r.h <= best.w * best.h) best = r
+  })
+  return best
+}
+
+function workspaceRow(binds) {
+  var nums = []
+  for (var d in binds) {
+    var m = d.match(/^Switch to workspace (\d+)$/)
+    if (m) nums.push([Number(m[1]), binds[d]])
+  }
+  if (nums.length < 2) return null
+  nums.sort(function(a, b) { return a[0] - b[0] })
+  var first = nums[0][1], last = nums[nums.length - 1][1]
+  var head = first.slice(0, first.lastIndexOf(" + "))
+  return { keys: head + " + " + first.slice(first.lastIndexOf(" + ") + 3) + "…" + last.slice(last.lastIndexOf(" + ") + 3),
+           label: "Switch workspace" }
+}
+
+function barCard(module, catalog) {
+  var binds = (catalog && catalog.binds) || {}
+  var widgets = (catalog && catalog.widgets) || {}
+  var ind = INDICATORS[module]
+  var w = widgets[module]
+  var name = ind ? ind.name : (w && w.name) || String(module || "Bar")
+  var description = ind ? ind.description : (w && w.description) || ""
+  if (description && !/[.!?]$/.test(description)) description += "."
+  var wanted = ind ? ind.binds : (WIDGET_BINDS[module] || [name])
+  var rows = []
+  wanted.forEach(function(d) { if (binds[d]) rows.push({ keys: binds[d], label: d }) })
+  if (module === "omarchy.workspaces") {
+    var ws = workspaceRow(binds)
+    if (ws) rows.unshift(ws)
+  }
   return {
-    tier: typeof parsed.tier === "string" ? parsed.tier : "none",
-    name: typeof parsed.name === "string" ? parsed.name : "",
-    role: typeof parsed.role === "string" ? parsed.role : "",
-    detail: typeof parsed.detail === "string" ? parsed.detail : "",
-    x: Number(parsed.x) || 0,
-    y: Number(parsed.y) || 0,
-  };
-}
-
-// Short badge text shown on the card so coverage gaps are visible
-// per-hover instead of silently inconsistent.
-function tierBadge(tier) {
-  switch (tier) {
-    case "bar": return "Bar";
-    case "atspi": return "AT-SPI";
-    case "window": return "Window";
-    default: return "";
+    kind: "bar", title: name, subtitle: description, detail: "",
+    sections: rows.length ? [{ heading: "Shortcuts", rows: rows }] : []
   }
 }
 
-// True when there's anything worth drawing a card for.
-function hasContent(hover) {
-  return !!(hover && hover.tier !== "none" && (hover.name || hover.detail));
+// ---- placement --------------------------------------------------------------
+
+function screenAt(screens, gx, gy) {
+  var list = screens || []
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i]
+    if (gx >= s.x && gx < s.x + s.width && gy >= s.y && gy < s.y + s.height)
+      return { screen: s, x: gx - s.x, y: gy - s.y }
+  }
+  return list.length ? { screen: list[0], x: 0, y: 0 } : { screen: null, x: 0, y: 0 }
+}
+
+// Below-right of the pointer like a tooltip; flipped away from edges so it
+// never runs off screen or sits under the pointer.
+function placeCard(px, py, w, h, aw, ah, gap, margin) {
+  var x = px + gap, y = py + gap
+  if (x + w > aw - margin) x = px - gap - w
+  if (y + h > ah - margin) y = py - gap - h
+  x = Math.max(margin, Math.min(x, aw - w - margin))
+  y = Math.max(margin, Math.min(y, ah - h - margin))
+  return { x: x, y: y }
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseHoverLine: parseHoverLine, tierBadge: tierBadge, hasContent: hasContent }
+  module.exports = {
+    parseLine: parseLine,
+    keyChips: keyChips,
+    barHit: barHit,
+    barCard: barCard,
+    workspaceRow: workspaceRow,
+    screenAt: screenAt,
+    placeCard: placeCard,
+    INDICATORS: INDICATORS
+  }
 }

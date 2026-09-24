@@ -1,45 +1,36 @@
 import QtQuick
 import Quickshell
-import Quickshell.Hyprland
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Click-through, always-on-top card that tracks the cursor while Help is
-// active. Same layer-shell technique as omarchy-keycaps/Panel.qml: an
-// empty `mask` makes the whole full-screen window pass every input event
-// through, so this can never intercept a hover/click meant for the app
-// underneath -- it only reads cursor position via the daemon's own
-// hyprctl polling, never Quickshell's own mouse events.
+// Click-through tooltip card: what's under the pointer and its shortcuts.
+// It appears after the pointer rests (the daemon decides when) on the
+// monitor under the pointer, beside it, and disappears as soon as the
+// pointer moves. An empty input mask means it can never take a click.
 Item {
   id: root
 
   property var shell: null
   property var manifest: null
-  // The shell hands overlays their plugin's service directly (and a scoped
-  // `shell`), never a `bar` -- v0.1 read `bar.shell`, which is always null
-  // here, so the card could never appear.
+  // Overlays receive their plugin's service directly -- never a `bar`.
   property var service: null
 
   readonly property var svc: service || (shell ? shell.serviceFor("renardoberou.help") : null)
-  readonly property var hover: svc ? svc.hover : ({ tier: "none", name: "", role: "", detail: "", x: 0, y: 0 })
-  readonly property bool showing: !!(svc && svc.active && Model.hasContent(hover))
+  readonly property var card: svc ? svc.card : null
+  readonly property bool showing: !!(svc && svc.active && card)
+  readonly property var where: card ? Model.screenAt(Quickshell.screens, card.x, card.y)
+                                    : { screen: null, x: 0, y: 0 }
 
-  readonly property var targetScreen: {
-    var monitor = Hyprland.focusedMonitor
-    var name = monitor ? String(monitor.name || "") : ""
-    var screens = Quickshell.screens || []
-    for (var i = 0; i < screens.length; i++) {
-      if (String(screens[i].name || "") === name) return screens[i]
-    }
-    return screens.length > 0 ? screens[0] : null
-  }
+  // Keep the last card's content while it fades out.
+  property var shown: null
+  onCardChanged: if (card) shown = card
 
   PanelWindow {
     id: panel
-    screen: root.targetScreen
-    visible: root.showing || card.opacity > 0.001
+    screen: root.where.screen
+    visible: root.showing || box.opacity > 0.001
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-help"
@@ -48,19 +39,22 @@ Item {
     exclusionMode: ExclusionMode.Ignore
     mask: Region {}
 
-    readonly property int cardWidth: Style.space(280)
-    readonly property int margin: Style.space(16)
+    readonly property int margin: Style.space(12)
+    readonly property int gap: Style.space(20)
 
     Item {
-      id: card
-      width: panel.cardWidth
-      height: column.implicitHeight + Style.space(16)
+      id: box
+      width: Math.min(Style.space(340), panel.width - 2 * panel.margin)
+      height: Math.min(column.implicitHeight + Style.space(18), panel.height - 2 * panel.margin)
+      clip: true
 
-      x: Math.max(panel.margin, Math.min(root.hover.x + Style.space(18), panel.width - width - panel.margin))
-      y: Math.max(panel.margin, Math.min(root.hover.y + Style.space(18), panel.height - height - panel.margin))
+      readonly property var spot: Model.placeCard(root.where.x, root.where.y, width, height,
+                                                  panel.width, panel.height, panel.gap, panel.margin)
+      x: spot.x
+      y: spot.y
 
       opacity: root.showing ? 1.0 : 0.0
-      Behavior on opacity { NumberAnimation { duration: 100; easing.type: Easing.OutCubic } }
+      Behavior on opacity { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
 
       Rectangle {
         anchors.fill: parent
@@ -73,36 +67,13 @@ Item {
       Column {
         id: column
         x: Style.space(12)
-        y: Style.space(8)
+        y: Style.space(9)
         width: parent.width - Style.space(24)
-        spacing: Style.space(3)
-
-        Row {
-          width: parent.width
-          spacing: Style.space(6)
-
-          Text {
-            textFormat: Text.PlainText
-            text: Model.tierBadge(root.hover.tier)
-            color: Color.accent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            font.bold: true
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            text: root.hover.role
-            visible: !!root.hover.role
-            color: Qt.darker(Color.popups.text, 1.3)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-        }
+        spacing: Style.space(4)
 
         Text {
           textFormat: Text.PlainText
-          text: root.hover.name
+          text: root.shown ? root.shown.title : ""
           width: parent.width
           elide: Text.ElideRight
           color: Color.popups.text
@@ -112,16 +83,97 @@ Item {
         }
 
         Text {
+          visible: !!(root.shown && root.shown.subtitle)
           textFormat: Text.PlainText
-          text: root.hover.detail
-          visible: !!root.hover.detail
+          text: root.shown ? root.shown.subtitle : ""
           width: parent.width
           wrapMode: Text.Wrap
-          maximumLineCount: 4
+          maximumLineCount: 3
           elide: Text.ElideRight
-          color: Color.popups.text
+          color: Qt.darker(Color.popups.text, 1.25)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          visible: !!(root.shown && root.shown.detail)
+          textFormat: Text.PlainText
+          text: root.shown ? root.shown.detail : ""
+          width: parent.width
+          elide: Text.ElideMiddle
+          color: Qt.darker(Color.popups.text, 1.6)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: root.shown ? (root.shown.sections || []) : []
+
+          delegate: Column {
+            required property var modelData
+            width: column.width
+            spacing: Style.space(3)
+            topPadding: Style.space(4)
+
+            Text {
+              textFormat: Text.PlainText
+              text: modelData.heading
+              color: Color.accent
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            Repeater {
+              model: modelData.rows
+
+              delegate: Row {
+                required property var modelData
+                width: column.width
+                spacing: Style.space(8)
+
+                Row {
+                  id: chips
+                  spacing: Style.space(3)
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Repeater {
+                    model: Model.keyChips(modelData.keys)
+                    delegate: Rectangle {
+                      required property var modelData
+                      width: chipText.implicitWidth + Style.space(8)
+                      height: chipText.implicitHeight + Style.space(3)
+                      radius: Style.space(3)
+                      color: "transparent"
+                      border.width: 1
+                      border.color: Qt.darker(Color.popups.text, 1.8)
+
+                      Text {
+                        id: chipText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: modelData
+                        color: Color.popups.text
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - chips.width - parent.spacing
+                  textFormat: Text.PlainText
+                  text: modelData.label
+                  elide: Text.ElideRight
+                  color: Qt.darker(Color.popups.text, 1.15)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+          }
         }
       }
     }

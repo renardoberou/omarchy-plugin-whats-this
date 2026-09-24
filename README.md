@@ -1,101 +1,103 @@
 # Help
 
-An Omarchy shell plugin: toggle it on from the bar, then hover anything —
-a bar icon, or a control inside a running app — and a card shows what it
-is and (where available) what it does. Toggle off anytime, same button.
+Point at anything in Omarchy and learn what it is — and how to do it from the
+keyboard. Turn Help on from the bar, then rest the pointer:
 
-## What it does
+- **on a window** — the app's name and what it is (from its desktop entry,
+  web apps included), the shortcut that opens it, and what you can do with
+  the window: close, full screen, float, pop out, group, move to a workspace.
+- **on a bar icon** — which widget it is and what it does (every Omarchy
+  widget, each indicator icon, and third-party widgets via their manifest),
+  plus its shortcuts: *Audio · Volume slider, output picker, per-app mixer ·
+  Super Ctrl A*.
+- **on empty desktop** — the workspace, and the shortcuts to get going from
+  there: apps menu, terminal, browser, switching workspaces.
 
-- **Bar toggle:** click the bar icon to arm/disarm. Off by default — the
-  daemon doesn't run at all until you turn it on.
-- **Tiered hover resolution**, `bin/omarchy-help-daemon` polls the cursor
-  ~12x/sec (`hyprctl cursorpos`) and resolves what's under it:
-  1. **AT-SPI** (`tier: "atspi"`) — the Linux accessibility bus. Best
-     coverage on GTK apps, which is where per-control name/role/description
-     actually comes from. Requires `python-gobject`.
-  2. **Window** (`tier: "window"`) — falls back to a Hyprland
-     client-at-point hit test (`hyprctl clients -j`) when AT-SPI has
-     nothing for that point. Always available, identifies the app/window,
-     not individual controls inside it.
-  3. **Nothing** — no card.
-  The card shows which tier answered, so coverage gaps are visible
-  per-hover instead of silently inconsistent.
-- **Card** follows the cursor, click-through (same layer-shell technique as
-  `omarchy-keycaps`) — it can never intercept a click meant for whatever's
-  underneath it.
+The card appears after the pointer rests for half a second, beside it, on the
+monitor you're using, and disappears the moment you move. It never takes a
+click.
 
-## Prerequisite
+**Shortcuts are read live** from Omarchy's own keybinding list
+(`omarchy menu keybindings --print`), so your remaps and your own bindings in
+`~/.config/hypr/bindings.lua` show up as you set them, and change when
+Hyprland reloads its config.
+
+## Install
 
 ```bash
-sudo pacman -S --needed python-gobject
+omarchy plugin add https://github.com/renardoberou/omarchy-plugin-help --enable
 ```
 
-**The daemon runs fine without this** — it degrades to window-level
-identification only (tier 2) and logs why to stderr, rather than refusing
-to start. Install `python-gobject` to enable tier-1 AT-SPI resolution.
+Needs nothing beyond a standard Omarchy system (Hyprland, the `omarchy` CLI,
+and the system `python3`, standard library only).
+
+## Remove
+
+```bash
+omarchy plugin remove renardoberou.help
+```
+
+Its only state is `~/.local/state/omarchy-help/active` (the toggle).
+
+## Cost
+
+Off: nothing runs. On: ~0.2–0.4% of one CPU core (measured with
+[Plugin Tax](https://github.com/renardoberou/omarchy-plugin-tax) on a laptop).
+The helper talks to Hyprland's IPC socket directly instead of starting
+`hyprctl`, polls only the pointer position, and refreshes the window list only
+after Hyprland announces a change. (v0.1 spent 13–18% of a core.)
+
+## IPC
+
+```bash
+omarchy-shell renardoberou.help toggle            # or: on / off
+omarchy-shell renardoberou.help status | jq
+omarchy-shell renardoberou.help inspectBar 1690 10  # what the card for that bar point says
+```
+
+## How bar-icon help works
+
+Plugins get no API that says which widget is under the pointer. Help's own
+bar pill lives *inside* the bar, though, so while Help is on it looks at the
+widgets next to it — each Omarchy bar widget carries a `moduleName` and knows
+its place on screen — and reports their rectangles, taking into account
+parents that hide or clip them. Names and descriptions come from each
+plugin's manifest (`omarchy-plugin-catalog`).
+
+This relies on bar widgets keeping `moduleName`, which every Omarchy and
+third-party bar widget has today. If a future Omarchy changes that, bar help
+falls back to saying nothing rather than something wrong.
+
+## Known limits
+
+- Help describes the *window* under the pointer, not individual buttons
+  inside apps: Wayland apps don't expose their controls to other programs in
+  a way that works reliably (v0.1 tried the accessibility bus; on this
+  machine almost no app published anything).
+- Shortcuts that apps define themselves (Ctrl+T in a browser) aren't known to
+  Omarchy, so they aren't shown.
+- A window's "Open" shortcuts come from Omarchy's launcher bindings; apps you
+  launch some other way have none.
 
 ## Structure
 
 ```
-manifest.json          schema + three entry points (service, bar-widget, overlay)
-Service.qml              headless: toggle state, owns the daemon process
-BarWidget.qml             bar pill toggle
-Overlay.qml                click-through card, tracks the cursor
-Model.js                   pure: JSON line parsing, tier badge text
-bin/omarchy-help-daemon  cursor poll -> AT-SPI hit -> Hyprland window hit -> JSON
-```
-
-## Install / remove
-
-```
-omarchy plugin add https://github.com/renardoberou/omarchy-plugin-help --enable
-omarchy plugin remove renardoberou.help
+manifest.json           service + bar-widget + overlay (keepLoaded)
+Service.qml             toggle (persisted), daemon, bar rectangles, IPC
+BarWidget.qml           bar toggle (?) and the bar-widget rectangle reporter
+Overlay.qml             click-through tooltip card with key chips
+Model.js                pure: key chips, bar hit-test, bar-widget cards, placement
+bin/omarchy-help-daemon pointer dwell, Hyprland IPC, keybindings, app identity, cards
+tests/                  node tests (Model.js), python tests (daemon)
 ```
 
 ## Local dev
 
-```
+```bash
 omarchy plugin validate .
 ln -sfn "$PWD" ~/.config/omarchy/plugins/renardoberou.help
 omarchy plugin enable renardoberou.help
-omarchy restart shell
-journalctl --user -t omarchy-shell --since "1 minute ago" | grep -i help
+omarchy restart shell          # edits in a symlinked checkout need a restart
+node --test tests/*.test.js
+python3 -m unittest discover -s tests
 ```
-
-Run the daemon directly to see its JSON stream without the shell at all:
-```
-./bin/omarchy-help-daemon
-```
-Confirmed live on this machine: with `python-gobject` not yet installed,
-it correctly logs the degradation to stderr and still emits real
-`tier: "window"` hits (e.g. hovering a game window correctly returned its
-Steam app id and title).
-
-`node -e "require('./Model.js').parseHoverLine('...')"` exercises the pure
-parsing logic without the daemon, AT-SPI, or the shell at all.
-
-## Known limits
-
-- **AT-SPI coverage is toolkit-dependent.** Strong for GTK. Unverified for
-  Qt on this machine (no Qt app was available to test against at
-  authoring time). Frequently thin-to-absent for Electron apps — many ship
-  their accessibility bridge off by default, or expose only coarse
-  landmarks rather than per-control detail. Tier 2 is the honest ceiling
-  for those apps.
-- **Whether Omarchy's own bar exposes anything over AT-SPI is unverified.**
-  Quickshell only publishes an accessibility tree if Qt's bridge is active
-  (nothing on this machine currently forces that on). If it does turn out
-  to be exposed, tier 1 will identify bar icons for free — this daemon
-  doesn't special-case the bar. If it doesn't, hovering the bar currently
-  falls through to tier 2, which identifies the shell's own window
-  generically rather than the specific icon underneath the cursor — a
-  real gap, not silently swallowed (the "window" tier badge signals it).
-  Closing that gap for the bar specifically (e.g. cross-referencing cursor
-  position against each widget's known layout + `omarchy plugin list
-  --json` manifest descriptions) is a documented follow-up, not done here.
-- **Tier 2's overlap handling is a heuristic.** `hyprctl clients -j` gives
-  no real z-order/stacking data; overlapping floating windows are resolved
-  by `focusHistoryID`, which can misattribute the hover to the wrong one.
-- **No caching.** Every hover is a fresh round-trip; very fast mouse
-  movement across many controls on a slow AT-SPI bridge could show
-  visible lag.

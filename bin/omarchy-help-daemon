@@ -1,273 +1,516 @@
 #!/usr/bin/python3
-# NOTE: NOT `#!/usr/bin/env python3` -- on this machine `python3` on PATH
-# resolves to a mise-managed interpreter that doesn't have `gi`/python-gobject
-# (that package installs into the system Python's site-packages). Hardcode
-# the system interpreter so tier-1 AT-SPI actually loads.
-"""omarchy-help-daemon — polls the cursor position and resolves what's
-under it via a tiered fallback, emitting one JSON line per CHANGE to
-stdout for Service.qml to consume.
+# NOTE: the system interpreter on purpose -- a `python3` on PATH may be a
+# version manager's build. Only the standard library is used.
+"""omarchy-help-daemon -- tooltip-style help for whatever the pointer rests on.
 
-Tiers:
-  1. atspi  — Linux accessibility bus (gi.repository.Atspi). Best for GTK
-              apps; coverage for Qt is unverified on this machine as of
-              writing, and typically thin-to-absent for Electron apps.
-  2. window — Hyprland client-at-point hit test (hyprctl clients -j),
-              always available, identifies the app/window but not
-              individual controls inside it.
-  3. none   — nothing resolved.
+Emits one JSON line per event to stdout for Service.qml:
 
-Degrades gracefully: if `python-gobject` isn't installed (gi.repository.Atspi
-unimportable), tier 1 is skipped entirely and every hover falls through to
-tier 2 -- the daemon still runs and is still useful, just at coarser
-granularity, rather than refusing to start. Install python-gobject
-(`sudo pacman -S --needed python-gobject`) to enable tier 1.
+  {"kind":"catalog", "binds":{desc: keys}, "widgets":{id: {name, description}}}
+      once at start and whenever Hyprland reloads its config
+  {"kind":"window"|"desktop", "x","y", "title","subtitle","detail",
+   "sections":[{"heading", "rows":[{"keys","label"}]}]}
+      when the pointer has rested ~0.45s over a window or empty desktop
+  {"kind":"bar", "x","y"}
+      pointer rested over the bar -- Service.qml knows each widget's
+      rectangle (reported by the bar pill) and builds that card itself
+  {"kind":"hide"}
+      the pointer moved away
 
-Known gap: whether Omarchy's own Quickshell bar exposes anything over
-AT-SPI is unverified -- if it does, tier 1 will identify bar icons "for
-free" (no special-casing here); if it doesn't, hovering the bar currently
-falls through to tier 2, which will identify the shell's own window
-generically rather than the specific icon. See README "Known limits".
+Cost: v0.1 spawned up to three `hyprctl` processes 12 times a second and
+walked the accessibility tree (~13-18% of a core). This talks to Hyprland's
+IPC socket directly (a local connect + read, no process), polls only the
+cursor, and refreshes the window list only after Hyprland reports a change
+on its event socket.
 """
 import json
+import os
+import re
+import socket
 import subprocess
 import sys
+import threading
 import time
 
-POLL_HZ = 12
-POLL_INTERVAL = 1.0 / POLL_HZ
-ATSPI_TIMEOUT_MS = 250
-BLACKLIST_TTL_S = 60
-BLACKLIST_AFTER_FAILURES = 3
-MAX_DESCEND_DEPTH = 6
+POLL_S = 1 / 15          # cursor poll
+DWELL_S = 0.45           # rest this long before a card appears
+MOVE_TOLERANCE = 6       # px of jitter that doesn't count as moving
+BAR_NAMESPACE = "omarchy-bar"
 
-try:
-    import gi
-    gi.require_version("Atspi", "2.0")
-    from gi.repository import Atspi
-    ATSPI_AVAILABLE = True
-    Atspi.set_timeout(ATSPI_TIMEOUT_MS, 0)
-except Exception as exc:  # ImportError, or a broken gi install
-    ATSPI_AVAILABLE = False
-    print(f"[help-daemon] AT-SPI unavailable ({exc}); tier 1 disabled, "
-          f"falling back to window-level identification only", file=sys.stderr)
+HOME = os.path.expanduser("~")
 
 
 def log(*args):
-    print("[help-daemon]", *args, file=sys.stderr, flush=True)
+    print("[help]", *args, file=sys.stderr, flush=True)
 
 
-def cursor_pos():
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+# ---- Hyprland IPC ---------------------------------------------------------
+
+def hypr_dir():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    run = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return os.path.join(run, "hypr", sig)
+
+
+def hypr(cmd, as_json=True):
+    """One request on Hyprland's command socket. Returns parsed JSON (or
+    text), or None if Hyprland isn't reachable."""
     try:
-        out = subprocess.run(
-            ["hyprctl", "cursorpos", "-j"], capture_output=True, text=True, timeout=0.3
-        )
-        d = json.loads(out.stdout)
-        return int(d["x"]), int(d["y"])
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            s.connect(os.path.join(hypr_dir(), ".socket.sock"))
+            s.sendall(("j/" + cmd if as_json else cmd).encode())
+            chunks = []
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+        data = b"".join(chunks).decode("utf-8", "replace")
+        return json.loads(data) if as_json else data
     except Exception:
         return None
 
 
-# --- Tier 1: AT-SPI -----------------------------------------------------
+class State:
+    """Window/layer/monitor lists, refreshed lazily after Hyprland events."""
 
-_app_blacklist = {}  # bus-name-ish key -> (fail_count, blacklisted_until)
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.dirty = True
+        self.reload_binds = False
+        self.clients = []
+        self.layers = {}
+        self.monitors = []
+        self.fetched = 0.0
+
+    def mark(self, binds=False):
+        with self.lock:
+            self.dirty = True
+            if binds:
+                self.reload_binds = True
+
+    def refresh(self):
+        with self.lock:
+            stale = self.dirty or time.monotonic() - self.fetched > 10
+            self.dirty = False
+        if not stale:
+            return
+        self.clients = hypr("clients") or []
+        self.layers = hypr("layers") or {}
+        self.monitors = hypr("monitors") or []
+        self.fetched = time.monotonic()
 
 
-def _app_key(app):
-    try:
-        return app.get_name() or str(app)
-    except Exception:
-        return str(id(app))
-
-
-def _blacklisted(key):
-    entry = _app_blacklist.get(key)
-    if not entry:
-        return False
-    fails, until = entry
-    if time.time() >= until:
-        _app_blacklist.pop(key, None)
-        return False
-    return True
-
-
-def _record_failure(key):
-    fails, _ = _app_blacklist.get(key, (0, 0))
-    fails += 1
-    until = time.time() + BLACKLIST_TTL_S if fails >= BLACKLIST_AFTER_FAILURES else 0
-    _app_blacklist[key] = (fails, until)
-
-
-def atspi_hit(x, y):
-    if not ATSPI_AVAILABLE:
-        return None
-    try:
-        desktop = Atspi.get_desktop(0)
-    except Exception:
-        return None
-
-    for i in range(desktop.get_child_count()):
+def listen_events(state):
+    """Hyprland's event socket: any window/layer/monitor change marks the
+    cache stale; a config reload also re-reads the keybindings."""
+    while True:
         try:
-            app = desktop.get_child_at_index(i)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(os.path.join(hypr_dir(), ".socket2.sock"))
+                buf = b""
+                while True:
+                    b = s.recv(4096)
+                    if not b:
+                        break
+                    buf += b
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        ev = line.split(b">>", 1)[0].decode("ascii", "replace")
+                        state.mark(binds=(ev == "configreloaded"))
         except Exception:
-            continue
-        if app is None:
-            continue
-        key = _app_key(app)
-        if _blacklisted(key):
-            continue
+            pass
+        time.sleep(2)
 
+
+# ---- keybindings ------------------------------------------------------------
+
+BIND_LINE = re.compile(r"^(?P<keys>\S.*?)\s+→\s+(?P<desc>.+?)\s*$")
+
+
+def parse_bind_printer(text):
+    """`omarchy menu keybindings --print` -> {description: keys}. First
+    binding wins when several keys share a description."""
+    out = {}
+    for line in text.splitlines():
+        m = BIND_LINE.match(line)
+        if m and m.group("desc") not in out:
+            out[m.group("desc")] = m.group("keys").strip()
+    return out
+
+
+def load_binds():
+    try:
+        r = subprocess.run(["omarchy", "menu", "keybindings", "--print"],
+                           capture_output=True, text=True, timeout=5)
+        return parse_bind_printer(r.stdout)
+    except Exception:
+        return {}
+
+
+LUA_BIND = re.compile(
+    r'o\.bind\(\s*"(?P<keys>[^"]+)"\s*,\s*"(?P<desc>[^"]+)"\s*,\s*(?P<action>\{[^}]*\}|"[^"]*")')
+LUA_FIELD = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+
+
+def parse_lua_launchers(text):
+    """Omarchy's Lua binding files -> [{desc, kind, value}] for bindings that
+    open an app: { omarchy = "terminal" }, { webapp = "https://..." },
+    { launch = "obsidian" }, { tui = "..." }."""
+    out = []
+    for m in LUA_BIND.finditer(text):
+        action = m.group("action")
+        fields = dict(LUA_FIELD.findall(action)) if action.startswith("{") else {}
+        for kind in ("webapp", "launch", "omarchy", "tui"):
+            if kind in fields:
+                out.append({"desc": m.group("desc"), "kind": kind, "value": fields[kind]})
+                break
+    return out
+
+
+def load_launchers():
+    files = []
+    for d in ("/usr/share/omarchy/default/hypr/bindings", os.path.join(HOME, ".local/share/omarchy/default/hypr/bindings")):
+        if os.path.isdir(d):
+            files += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".lua")]
+    files.append(os.path.join(HOME, ".config/hypr/bindings.lua"))
+    out = []
+    for f in files:
         try:
-            hit = None
-            # Pre-filter: only query windows whose own bounding box
-            # actually contains the point, to avoid hammering every app
-            # on every tick.
-            for wi in range(app.get_child_count()):
-                win = app.get_child_at_index(wi)
-                if win is None:
-                    continue
-                comp = win.get_component_iface()
-                if comp is None:
-                    continue
-                ext = comp.get_extents(Atspi.CoordType.SCREEN)
-                if not (ext.x <= x < ext.x + ext.width and ext.y <= y < ext.y + ext.height):
-                    continue
-                hit = comp.get_accessible_at_point(x, y, Atspi.CoordType.SCREEN)
-                if hit is not None:
-                    break
+            with open(f, encoding="utf-8") as fh:
+                out += parse_lua_launchers(fh.read())
+        except OSError:
+            pass
+    return out
 
-            if hit is None:
-                continue
 
-            # get_accessible_at_point isn't guaranteed to return the
-            # deepest leaf on every toolkit -- recurse a bounded number
-            # of times until it stops making progress.
-            depth = 0
-            current = hit
-            while depth < MAX_DESCEND_DEPTH:
-                comp = current.get_component_iface()
-                if comp is None:
-                    break
-                nxt = comp.get_accessible_at_point(x, y, Atspi.CoordType.SCREEN)
-                if nxt is None or nxt == current:
-                    break
-                current = nxt
-                depth += 1
+# ---- what an app is ---------------------------------------------------------
 
-            name = current.get_name() or ""
-            role = current.get_role_name() or ""
-            try:
-                description = current.get_description() or ""
-            except Exception:
-                description = ""
-            if not name and not description:
-                continue
-            return {"tier": "atspi", "name": name, "role": role, "detail": description}
-        except Exception:
-            _record_failure(key)
+def parse_desktop(text):
+    entry, section = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
             continue
+        if section == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            if k in ("Name", "GenericName", "Comment", "StartupWMClass", "Exec", "NoDisplay", "Type"):
+                entry.setdefault(k, v.strip())
+    return entry
+
+
+WEBAPP_URL = re.compile(r"https?://([^/\s\"']+)(/[^\s\"']*)?")
+
+
+def webapp_key(host, path=""):
+    """Chrome web-app window classes look like chrome-app.hey.com__calendar_weeks_-Default
+    (or chrome-youtube.com__-Default for a bare host): compare without the
+    trailing underscores Chrome adds."""
+    p = (path or "").strip("/").replace("/", "_")
+    return (host.lower() + ("__" + p if p else "")).rstrip("_")
+
+
+def chrome_inner(cls):
+    """chrome-youtube.com__-Default -> youtube.com; '' if not a Chrome web app."""
+    lc = (cls or "").lower()
+    if not lc.startswith("chrome-"):
+        return ""
+    inner = lc[len("chrome-"):]
+    if inner.endswith("-default"):
+        inner = inner[:-len("-default")]
+    return inner.rstrip("_")
+
+
+class Apps:
+    def __init__(self):
+        self.by_key = {}
+        dirs = [os.path.join(HOME, ".local/share/applications"), "/usr/share/applications",
+                os.path.join(HOME, ".local/share/flatpak/exports/share/applications"),
+                "/var/lib/flatpak/exports/share/applications"]
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in sorted(os.listdir(d)):
+                if not f.endswith(".desktop"):
+                    continue
+                try:
+                    with open(os.path.join(d, f), encoding="utf-8", errors="replace") as fh:
+                        e = parse_desktop(fh.read())
+                except OSError:
+                    continue
+                if e.get("Type", "Application") != "Application" or not e.get("Name"):
+                    continue
+                e["id"] = f[:-8]
+                keys = [e["id"].lower(), e.get("StartupWMClass", "").lower()]
+                exe = e.get("Exec", "").split()
+                if exe:
+                    keys.append(os.path.basename(exe[0]).lower())
+                m = WEBAPP_URL.search(e.get("Exec", ""))
+                if m and ("webapp" in e.get("Exec", "") or "--app=" in e.get("Exec", "")):
+                    keys.append("web:" + webapp_key(m.group(1), m.group(2)))
+                    keys.append("web:" + m.group(1).lower())
+                for k in keys:
+                    if k and k not in self.by_key:   # user entries (listed first) win
+                        self.by_key[k] = e
+
+    def identify(self, cls, initial=""):
+        for c in (cls, initial):
+            c = (c or "").strip()
+            if not c:
+                continue
+            lc = c.lower()
+            inner = chrome_inner(lc)
+            if inner:
+                e = self.by_key.get("web:" + inner) or self.by_key.get("web:" + inner.split("__")[0])
+                if e:
+                    return e
+            for k in (lc, lc.split(".")[-1], lc.replace(" ", "-")):
+                if k in self.by_key:
+                    return self.by_key[k]
+        return None
+
+
+def default_terminal():
+    try:
+        with open(os.path.join(HOME, ".config/xdg-terminals.list"), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line.replace(".desktop", "").split(":")[0].lower()
+    except OSError:
+        pass
+    return ""
+
+
+def default_browser():
+    try:
+        r = subprocess.run(["xdg-settings", "get", "default-web-browser"],
+                           capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().replace(".desktop", "").lower()
+    except Exception:
+        return ""
+
+
+# What Omarchy's `{ omarchy = "..." }` launch names open.
+OMARCHY_APPS = {"nautilus": "org.gnome.nautilus", "nautilus-cwd": "org.gnome.nautilus",
+                "spotify": "spotify", "signal": "signal", "1password": "1password"}
+
+
+def launcher_matches(launcher, app, cls, term, browser):
+    kind, value = launcher["kind"], launcher["value"]
+    app_id = (app or {}).get("id", "").lower()
+    lc = (cls or "").lower()
+    if kind == "webapp":
+        m = WEBAPP_URL.search(value)
+        inner = chrome_inner(lc)
+        if not m or not inner:
+            return False
+        return inner == webapp_key(m.group(1), m.group(2)) or inner == m.group(1).lower()
+    if kind == "launch":
+        return value.lower() in (app_id, lc, lc.split(".")[-1])
+    if kind == "omarchy":
+        name = value.split()[0]
+        if name.startswith("terminal"):
+            return bool(term) and term in (app_id, lc)
+        if name == "browser":
+            return bool(browser) and (browser in (app_id, lc) or browser.split("-")[-1] in lc) and not lc.startswith("chrome-")
+        target = OMARCHY_APPS.get(name, name)
+        return target in (app_id, lc, lc.split(".")[-1])
+    return False
+
+
+# ---- cards ------------------------------------------------------------------
+
+WINDOW_ACTIONS = ["Close window", "Full screen", "Toggle window floating/tiling",
+                  "Pop window out (float & pin)", "Toggle window grouping",
+                  "Move window to scratchpad"]
+DESKTOP_ACTIONS = ["Apps menu", "Terminal", "Browser", "Omarchy menu",
+                   "Toggle scratchpad", "Keybindings"]
+
+
+def numbered(binds, pattern, label):
+    """Collapse 'Switch to workspace 1..10' into one row: SUPER + 1…0."""
+    rx = re.compile(pattern)
+    keys = [(int(m.group(1)), k) for d, k in binds.items() for m in [rx.match(d)] if m]
+    if not keys:
+        return None
+    keys.sort()
+    first, last = keys[0][1], keys[-1][1]
+    if len(keys) > 1 and " + " in first and " + " in last:
+        head = first.rsplit(" + ", 1)[0]
+        return {"keys": f"{head} + {first.rsplit(' + ', 1)[1]}…{last.rsplit(' + ', 1)[1]}", "label": label}
+    return {"keys": first, "label": label}
+
+
+def rows(binds, descs):
+    return [{"keys": binds[d], "label": d} for d in descs if d in binds]
+
+
+def window_card(client, apps, binds, launchers, term, browser):
+    cls = client.get("class", "")
+    app = apps.identify(cls, client.get("initialClass", ""))
+    name = (app or {}).get("Name") or cls.split(".")[-1].replace("-", " ").title() or "Window"
+    subtitle = (app or {}).get("GenericName") or (app or {}).get("Comment") or ""
+    comment = (app or {}).get("Comment", "")
+    if subtitle and comment and comment != subtitle:
+        subtitle = f"{subtitle} — {comment}"
+    title = client.get("title", "")
+    sections = []
+    opens = [{"keys": binds[l["desc"]], "label": l["desc"]}
+             for l in launchers if l["desc"] in binds and launcher_matches(l, app, cls, term, browser)]
+    seen, opens_u = set(), []
+    for r in opens:
+        if r["label"] not in seen:
+            seen.add(r["label"]); opens_u.append(r)
+    if opens_u:
+        sections.append({"heading": "Open " + name, "rows": opens_u[:3]})
+    acts = rows(binds, WINDOW_ACTIONS)
+    ws = numbered(binds, r"^Move window to workspace (\d+)$", "Move to workspace")
+    if ws:
+        acts.append(ws)
+    if acts:
+        sections.append({"heading": "This window", "rows": acts})
+    return {"kind": "window", "title": name, "subtitle": subtitle,
+            "detail": title if title and title != name else "", "sections": sections}
+
+
+def desktop_card(monitor, binds):
+    ws = (monitor or {}).get("activeWorkspace", {}).get("name") or ""
+    acts = rows(binds, DESKTOP_ACTIONS)
+    sw = numbered(binds, r"^Switch to workspace (\d+)$", "Switch workspace")
+    if sw:
+        acts.insert(1, sw)
+    return {"kind": "desktop", "title": "Workspace " + ws if ws else "Desktop",
+            "subtitle": "Empty space — nothing under the pointer",
+            "detail": "", "sections": [{"heading": "From here", "rows": acts}] if acts else []}
+
+
+def contains(x, y, ax, ay, w, h):
+    return ax <= x < ax + w and ay <= y < ay + h
+
+
+def over_bar(layers, x, y):
+    for mon in (layers or {}).values():
+        for level in mon.get("levels", {}).values():
+            for l in level:
+                if l.get("namespace") == BAR_NAMESPACE and contains(x, y, l.get("x", 0), l.get("y", 0), l.get("w", 0), l.get("h", 0)):
+                    return True
+    return False
+
+
+def monitor_at(monitors, x, y):
+    for m in monitors or []:
+        s = m.get("scale", 1) or 1
+        if contains(x, y, m.get("x", 0), m.get("y", 0), m.get("width", 0) / s, m.get("height", 0) / s):
+            return m
     return None
 
 
-# --- Tier "bar": Omarchy's own bar, generic (spike result, see README) --
-#
-# Confirmed live on this machine: Quickshell registers AT-SPI application
-# entries ("quickshell"/"qs") but exposes ZERO accessible children beneath
-# them -- tier 1 genuinely cannot resolve individual bar icons here. The
-# bar is a Wayland layer-shell surface (namespace "omarchy-bar" per
-# `hyprctl layers -j`), not a regular window, so tier 2 doesn't see it
-# either. This tier at least identifies "you're over the bar" generically
-# from real layer-shell geometry, rather than falling through to nothing.
-# Per-icon resolution would need either shell-side cooperation (a new API,
-# out of scope for a plugin) or reimplementing the whole bar as a
-# "bar"-kind plugin (which does get widget-registry access) -- documented
-# as a known limit, not faked here.
-
-def bar_hit(x, y):
-    try:
-        out = subprocess.run(["hyprctl", "layers", "-j"], capture_output=True, text=True, timeout=0.3)
-        layers = json.loads(out.stdout)
-    except Exception:
+def window_at(clients, monitor, x, y):
+    """Topmost visible window under the point: on the monitor's active (or
+    special) workspace; floating windows sit above tiled ones; among equals,
+    the most recently focused wins."""
+    if not monitor:
         return None
-    for monitor_data in layers.values():
-        for level_layers in monitor_data.get("levels", {}).values():
-            for layer in level_layers:
-                ns = str(layer.get("namespace", ""))
-                if "bar" not in ns.lower():
-                    continue
-                lx, ly = layer.get("x", 0), layer.get("y", 0)
-                lw, lh = layer.get("w", 0), layer.get("h", 0)
-                if lx <= x < lx + lw and ly <= y < ly + lh:
-                    return {
-                        "tier": "bar", "name": "Omarchy bar", "role": "",
-                        "detail": "Per-icon detail isn't available here (see README) "
-                                  "-- hover an app window for AT-SPI/window-level detail.",
-                    }
-    return None
-
-
-# --- Tier 2: Hyprland window-at-point ------------------------------------
-
-def window_hit(x, y):
-    try:
-        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=0.3)
-        clients = json.loads(out.stdout)
-    except Exception:
-        return None
-
-    candidates = []
-    for c in clients:
-        if c.get("hidden"):
+    active = {monitor.get("activeWorkspace", {}).get("id"), monitor.get("specialWorkspace", {}).get("id")}
+    hits = []
+    for c in clients or []:
+        if c.get("hidden") or not c.get("mapped", True):
             continue
-        try:
-            cx, cy = c["at"]
-            cw, ch = c["size"]
-        except Exception:
+        if c.get("workspace", {}).get("id") not in active:
             continue
-        if cx <= x < cx + cw and cy <= y < cy + ch:
-            candidates.append(c)
-    if not candidates:
+        (cx, cy), (cw, ch) = c.get("at", [0, 0]), c.get("size", [0, 0])
+        if contains(x, y, cx, cy, cw, ch):
+            hits.append(c)
+    if not hits:
         return None
-    # No real z-order data from this call -- lowest focusHistoryID is a
-    # cheap "most recently focused" heuristic, not a true topmost test.
-    candidates.sort(key=lambda c: c.get("focusHistoryID", 999))
-    c = candidates[0]
-    return {"tier": "window", "name": c.get("class", ""), "role": "", "detail": c.get("title", "")}
+    hits.sort(key=lambda c: (0 if c.get("pinned") else 1, 0 if c.get("floating") else 1, c.get("focusHistoryID", 999)))
+    return hits[0]
 
 
-def resolve(x, y):
-    hit = atspi_hit(x, y)
-    if hit:
-        hit["x"], hit["y"] = x, y
-        return hit
-    hit = bar_hit(x, y)
-    if hit:
-        hit["x"], hit["y"] = x, y
-        return hit
-    hit = window_hit(x, y)
-    if hit:
-        hit["x"], hit["y"] = x, y
-        return hit
-    return {"tier": "none", "name": "", "role": "", "detail": "", "x": x, "y": y}
+def load_widgets():
+    try:
+        r = subprocess.run(["omarchy-plugin-catalog"], capture_output=True, text=True, timeout=5)
+        out = {}
+        for p in json.loads(r.stdout or "[]"):
+            bw = p.get("barWidget") or {}
+            out[p.get("id", "")] = {"name": bw.get("displayName") or p.get("name") or p.get("id"),
+                                    "description": bw.get("description") or p.get("description") or ""}
+        return out
+    except Exception:
+        return {}
 
 
 def main():
-    last_emitted = None
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        log("not running under Hyprland")
+        emit({"kind": "error", "message": "Help needs Hyprland."})
+        return
+    state = State()
+    threading.Thread(target=listen_events, args=(state,), daemon=True).start()
+
+    apps = Apps()
+    term, browser = default_terminal(), default_browser()
+    binds, launchers = load_binds(), load_launchers()
+    emit({"kind": "catalog", "binds": binds, "widgets": load_widgets()})
+
+    anchor, still_since, shown = None, 0.0, False
     while True:
-        start = time.time()
-        pos = cursor_pos()
-        if pos is not None:
-            x, y = pos
-            result = resolve(x, y)
-            key = (result["tier"], result["name"], result["role"], result["detail"])
-            if key != last_emitted:
-                last_emitted = key
-                print(json.dumps(result), flush=True)
-        elapsed = time.time() - start
-        time.sleep(max(0.0, POLL_INTERVAL - elapsed))
+        t0 = time.monotonic()
+        if state.reload_binds:
+            state.reload_binds = False
+            binds, launchers = load_binds(), load_launchers()
+            emit({"kind": "catalog", "binds": binds, "widgets": load_widgets()})
+
+        pos = hypr("cursorpos")
+        if pos and "x" in pos:
+            x, y = int(pos["x"]), int(pos["y"])
+            if anchor is None or abs(x - anchor[0]) > MOVE_TOLERANCE or abs(y - anchor[1]) > MOVE_TOLERANCE:
+                anchor, still_since = (x, y), t0
+                if shown:
+                    emit({"kind": "hide"})
+                    shown = False
+            elif not shown and t0 - still_since >= DWELL_S:
+                shown = True
+                state.refresh()
+                if over_bar(state.layers, x, y):
+                    card = {"kind": "bar"}
+                else:
+                    mon = monitor_at(state.monitors, x, y)
+                    win = window_at(state.clients, mon, x, y)
+                    card = window_card(win, apps, binds, launchers, term, browser) if win else desktop_card(mon, binds)
+                card["x"], card["y"] = x, y
+                emit(card)
+        time.sleep(max(0.0, POLL_S - (time.monotonic() - t0)))
+
+
+def state_cmd(args):
+    """--state [on|off]: read or persist the bar toggle."""
+    d = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "omarchy-help")
+    f = os.path.join(d, "active")
+    if args and args[0] in ("on", "off"):
+        os.makedirs(d, exist_ok=True)
+        with open(f, "w") as fh:
+            fh.write(args[0] + "\n")
+        return
+    try:
+        with open(f) as fh:
+            print(fh.read().strip() or "off")
+    except OSError:
+        print("off")
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--state"]:
+        state_cmd(sys.argv[2:])
+        sys.exit(0)
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, BrokenPipeError):
         pass
